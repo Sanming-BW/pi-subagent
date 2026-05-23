@@ -10,6 +10,11 @@
     "runner.ts",
     "runner-cli.js",
     "runner-events.js",
+    "line-history.ts",
+    "line-lock.ts",
+    "session-checkpoint.ts",
+    "tool-selection.ts",
+    "worktree-fingerprint.ts",
     "render.ts",
     "types.ts",
     "agents/*.md",
@@ -69,5 +74,8 @@
     "@sinclair/typebox": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "@mjakl/pi-subagent": "."
   }
 }

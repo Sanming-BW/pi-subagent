@@ -79,6 +79,12 @@ export function processPiEvent(event, result) {
   if (!event || typeof event !== "object") return false;
 
   switch (event.type) {
+    case "session":
+      if (typeof event.id === "string") result.childSessionId = event.id;
+      if (typeof event.sessionFile === "string") result.childSessionFile = event.sessionFile;
+      if (typeof event.leafId === "string") result.childLeafId = event.leafId;
+      return typeof event.id === "string";
+
     case "message_end":
       return addAssistantMessage(result, event.message);
 

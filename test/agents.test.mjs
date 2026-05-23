@@ -19,6 +19,7 @@ function createTestableAgentsModule() {
   const stubPath = path.join(tmpDir, "pi-coding-agent-stub.mjs");
   const modulePath = path.join(tmpDir, "agents.testable.ts");
   const sourcePath = path.join(process.cwd(), "agents.ts");
+  const toolSelectionPath = path.join(process.cwd(), "tool-selection.ts");
 
   fs.writeFileSync(
     stubPath,
@@ -44,8 +45,10 @@ function createTestableAgentsModule() {
     .replace(
       'from "@mariozechner/pi-coding-agent"',
       'from "./pi-coding-agent-stub.mjs"',
-    );
+    )
+    .replace('./tool-selection.js', './tool-selection.ts');
   fs.writeFileSync(modulePath, source);
+  fs.writeFileSync(path.join(tmpDir, "tool-selection.ts"), fs.readFileSync(toolSelectionPath, "utf-8"));
 
   return {
     moduleUrl: pathToFileURL(modulePath).href,

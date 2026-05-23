@@ -150,6 +150,22 @@ function statusIcon(r: SingleResult, theme: { fg: ThemeFg }): string {
 	return isResultError(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
+function formatLineMetadata(r: SingleResult, theme: { fg: ThemeFg }): string | undefined {
+	const line = r.lineEvent;
+	if (!line) return undefined;
+	const parts = [`line:${line.lineId}`];
+	if (line.childSessionId) {
+		parts.push(line.childLeafId ? `${line.childSessionId}@${line.childLeafId}` : line.childSessionId);
+	}
+	if (line.copyOnWrite) parts.push("copy-on-write");
+	return theme.fg("dim", parts.join(" "));
+}
+
+function formatWarning(r: SingleResult, theme: { fg: ThemeFg }): string | undefined {
+	if (!r.warning && !r.lineEvent?.warning) return undefined;
+	return theme.fg("warning", r.warning ?? r.lineEvent?.warning ?? "");
+}
+
 // ---------------------------------------------------------------------------
 // renderCall — shown while the tool is being invoked
 // ---------------------------------------------------------------------------
@@ -254,6 +270,11 @@ function renderSingleExpanded(
 		container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 	}
 
+	const lineMetadata = formatLineMetadata(r, theme);
+	if (lineMetadata) container.addChild(new Text(lineMetadata, 0, 0));
+	const warning = formatWarning(r, theme);
+	if (warning) container.addChild(new Text(warning, 0, 0));
+
 	// Task
 	container.addChild(new Spacer(1));
 	container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
@@ -297,6 +318,10 @@ function renderSingleCollapsed(
 ): Text {
 	let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource}, ${delegationMode})`)}`;
 	if (error && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+	const lineMetadata = formatLineMetadata(r, theme);
+	if (lineMetadata) text += `\n${lineMetadata}`;
+	const warning = formatWarning(r, theme);
+	if (warning) text += `\n${warning}`;
 
 	if (error && r.errorMessage) {
 		text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
@@ -377,6 +402,10 @@ function renderParallelExpanded(
 
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`, 0, 0));
+		const lineMetadata = formatLineMetadata(r, theme);
+		if (lineMetadata) container.addChild(new Text(lineMetadata, 0, 0));
+		const warning = formatWarning(r, theme);
+		if (warning) container.addChild(new Text(warning, 0, 0));
 		container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 
 		for (const item of displayItems) {
@@ -421,6 +450,10 @@ function renderParallelCollapsed(
 		const rIcon = statusIcon(r, theme);
 		const displayItems = getDisplayItems(r.messages);
 		text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+		const lineMetadata = formatLineMetadata(r, theme);
+		if (lineMetadata) text += `\n${lineMetadata}`;
+		const warning = formatWarning(r, theme);
+		if (warning) text += `\n${warning}`;
 		if (displayItems.length === 0) {
 			text += `\n${theme.fg(r.exitCode === -1 ? "muted" : isResultError(r) ? "error" : "muted", r.exitCode === -1 ? "(running...)" : getResultSummaryText(r))}`;
 		} else {

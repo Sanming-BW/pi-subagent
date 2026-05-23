@@ -16,6 +16,7 @@ import {
   type DelegationMode,
   type SingleResult,
   type SubagentDetails,
+  type WorktreeFingerprint,
   emptyUsage,
   getFinalOutput,
   normalizeCompletedResult,
@@ -83,6 +84,64 @@ function cleanupTempDir(dir: string | null): void {
   }
 }
 
+function findSessionFileById(sessionId: string, startDir: string): string | undefined {
+  const candidates = [process.env.PI_CODING_AGENT_SESSION_DIR, path.join(os.homedir(), ".pi", "agent", "sessions")]
+    .filter((value): value is string => Boolean(value));
+
+  for (const root of candidates) {
+    try {
+      if (!fs.existsSync(root)) continue;
+      const stack = [root];
+      while (stack.length > 0) {
+        const dir = stack.pop()!;
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            stack.push(p);
+          } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+            const firstLine = fs.readFileSync(p, "utf8").split(/\r?\n/, 1)[0];
+            if (!firstLine) continue;
+            try {
+              const header = JSON.parse(firstLine);
+              if (header?.type === "session" && header.id === sessionId) return p;
+            } catch {
+              /* ignore invalid session candidates */
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore inaccessible session roots */
+    }
+  }
+
+  void startDir;
+  return undefined;
+}
+
+function getSessionLeafId(sessionFile: string): string | undefined {
+  try {
+    const entries = fs.readFileSync(sessionFile, "utf8").trim().split(/\r?\n/)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry?.type !== "session" && typeof entry?.id === "string");
+    if (entries.length === 0) return undefined;
+    const parentIds = new Set(entries.map((entry) => entry.parentId).filter((id) => typeof id === "string"));
+    return entries.findLast((entry) => !parentIds.has(entry.id))?.id ?? entries.at(-1)?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+function finalizeChildCheckpoint(result: SingleResult): void {
+  if (!result.childSessionId) return;
+  if (!result.childSessionFile) {
+    result.childSessionFile = findSessionFileById(result.childSessionId, process.cwd());
+  }
+  if (!result.childLeafId && result.childSessionFile) {
+    result.childLeafId = getSessionLeafId(result.childSessionFile);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Build pi CLI arguments
 // ---------------------------------------------------------------------------
@@ -94,7 +153,8 @@ function buildPiArgs(
   systemPromptPath: string | null,
   task: string,
   delegationMode: DelegationMode,
-  forkSessionPath: string | null,
+  sessionPath: string | null,
+  lineId?: string,
 ): string[] {
   const args: string[] = [
     "--mode",
@@ -104,10 +164,10 @@ function buildPiArgs(
     "-p",
   ];
 
-  if (delegationMode === "spawn") {
+  if (delegationMode === "spawn" && !lineId) {
     args.push("--no-session");
-  } else if (forkSessionPath) {
-    args.push("--session", forkSessionPath);
+  } else if (sessionPath) {
+    args.push("--session", sessionPath);
   }
 
   const model = agent.model ?? inheritedCliArgs.fallbackModel;
@@ -116,14 +176,16 @@ function buildPiArgs(
   const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
   if (thinking) args.push("--thinking", thinking);
 
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  } else if (agent.tools === undefined) {
+  if (agent.tools === undefined) {
     if (inheritedCliArgs.fallbackTools !== undefined) {
       args.push("--tools", inheritedCliArgs.fallbackTools);
     } else if (inheritedCliArgs.fallbackNoTools) {
       args.push("--no-tools");
     }
+  } else if (agent.tools.length > 0) {
+    args.push("--tools", agent.tools.join(","));
+  } else {
+    args.push("--no-tools");
   }
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
@@ -150,6 +212,18 @@ export interface RunAgentOptions {
   delegationMode: DelegationMode;
   /** Serialized parent session snapshot used when delegationMode is "fork". */
   forkSessionSnapshotJsonl?: string;
+  /** Existing child session file used when delegationMode is "continue". */
+  continueSessionFile?: string;
+  /** Optional line id for checkpoint metadata. */
+  lineId?: string;
+  /** Previous checkpoint for continue metadata. */
+  continuedFrom?: { childSessionId: string; childSessionFile?: string; childLeafId?: string };
+  /** Worktree state captured after this run. */
+  worktree?: WorktreeFingerprint;
+  /** Warning shown/injected for this run. */
+  warning?: string;
+  /** Whether this continue run materialized a copied child checkpoint first. */
+  copyOnWrite?: boolean;
   /** Current delegation depth of the caller process. */
   parentDepth: number;
   /** Delegation stack from the caller process (ancestor agent names). */
@@ -180,6 +254,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     taskCwd,
     delegationMode,
     forkSessionSnapshotJsonl,
+    continueSessionFile,
+    lineId,
+    continuedFrom,
+    worktree,
+    warning,
+    copyOnWrite,
     parentDepth,
     parentAgentStack,
     maxDepth,
@@ -220,6 +300,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       stopReason: "error",
       errorMessage:
         "Cannot run in fork mode: missing parent session snapshot context.",
+    };
+  }
+
+  if (delegationMode === "continue" && !continueSessionFile) {
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: "Cannot run in continue mode: missing child session file checkpoint.",
+      usage: emptyUsage(),
+      model: agent.model,
+      stopReason: "error",
+      errorMessage: "Cannot run in continue mode: missing child session file checkpoint.",
     };
   }
 
@@ -264,13 +359,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     forkSessionTmpPath = tmp.filePath;
   }
 
+  const childSessionPath = delegationMode === "continue" ? (continueSessionFile ?? null) : forkSessionTmpPath;
+
   try {
     const piArgs = buildPiArgs(
       agent,
       promptTmpPath,
       task,
       delegationMode,
-      forkSessionTmpPath,
+      childSessionPath,
+      lineId,
     );
     let wasAborted = false;
 
@@ -405,6 +503,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
 
     result.exitCode = exitCode;
+    finalizeChildCheckpoint(result);
+    if (lineId && result.childSessionId) {
+      result.lineEvent = {
+        event: delegationMode === "continue" ? "continue" : "open",
+        agentName,
+        lineId,
+        childSessionId: result.childSessionId,
+        childSessionFile: result.childSessionFile,
+        childLeafId: result.childLeafId,
+        originMode: delegationMode,
+        continuedFrom,
+        worktree,
+        warning,
+        copyOnWrite,
+      };
+      if (warning) result.warning = warning;
+    }
     return normalizeCompletedResult(result, wasAborted);
   } finally {
     cleanupTempDir(promptTmpDir);

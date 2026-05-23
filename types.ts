@@ -6,7 +6,32 @@ import type { Message } from "@mariozechner/pi-ai";
 import { getFinalAssistantText } from "./runner-events.js";
 
 /** Context mode for delegated runs. */
-export type DelegationMode = "spawn" | "fork";
+export type DelegationMode = "spawn" | "fork" | "continue";
+
+export interface WorktreeFingerprint {
+	cwd: string;
+	gitHead?: string;
+	statusHash?: string;
+	diffHash?: string;
+}
+
+export interface SubagentLineEvent {
+	event: "open" | "continue";
+	agentName: string;
+	lineId: string;
+	childSessionId: string;
+	childSessionFile?: string;
+	childLeafId?: string;
+	originMode: DelegationMode;
+	continuedFrom?: {
+		childSessionId: string;
+		childSessionFile?: string;
+		childLeafId?: string;
+	};
+	worktree?: WorktreeFingerprint;
+	copyOnWrite?: boolean;
+	warning?: string;
+}
 
 /** Default context mode for delegated runs. */
 export const DEFAULT_DELEGATION_MODE: DelegationMode = "spawn";
@@ -35,6 +60,11 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	sawAgentEnd?: boolean;
+	childSessionId?: string;
+	childSessionFile?: string;
+	childLeafId?: string;
+	lineEvent?: SubagentLineEvent;
+	warning?: string;
 }
 
 /** Metadata attached to every tool result for rendering. */

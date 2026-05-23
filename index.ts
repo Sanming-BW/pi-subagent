@@ -16,9 +16,13 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, discoverAgents } from "./agents.js";
+import { findVisibleLine, formatAvailableLines } from "./line-history.js";
 import { renderCall, renderResult } from "./render.js";
+import { materializeCheckpointSnapshot, needsCopyOnWrite } from "./session-checkpoint.js";
 import { getResultSummaryText } from "./runner-events.js";
+import { withLineLock } from "./line-lock.js";
 import { mapConcurrent, runAgent } from "./runner.js";
+import { getWorktreeFingerprint, hasWorktreeDrift, WORKTREE_DRIFT_TASK_PREFIX } from "./worktree-fingerprint.js";
 import {
   type DelegationMode,
   type SingleResult,
@@ -98,6 +102,12 @@ const SubagentParams = Type.Object({
       description: "Working directory for the agent process (single mode only)",
     }),
   ),
+  lineId: Type.Optional(
+    Type.String({
+      description:
+        "Optional reusable subagent line id. Required for mode='continue'. With spawn/fork, records a checkpoint for later continue.",
+    }),
+  ),
 });
 
 // ---------------------------------------------------------------------------
@@ -121,7 +131,7 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
   if (raw === undefined) return DEFAULT_DELEGATION_MODE;
   if (typeof raw !== "string") return null;
   const normalized = raw.trim().toLowerCase();
-  if (normalized === "spawn" || normalized === "fork") {
+  if (normalized === "spawn" || normalized === "fork" || normalized === "continue") {
     return normalized;
   }
   return null;
@@ -326,6 +336,12 @@ function formatAgentNames(agents: AgentConfig[]): string {
   return agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 }
 
+function getAllToolNames(pi: ExtensionAPI): string[] {
+  const getAllTools = (pi as ExtensionAPI & { getAllTools?: () => Array<{ name: string }> }).getAllTools;
+  if (typeof getAllTools !== "function") return [];
+  return getAllTools().map((tool) => tool.name).filter(Boolean);
+}
+
 function getCycleViolations(
   requestedNames: Set<string>,
   ancestorAgentStack: string[],
@@ -389,7 +405,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!canDelegate) return;
 
-    const discovery = discoverAgents(ctx.cwd, "both");
+    const discovery = discoverAgents(ctx.cwd, "both", getAllToolNames(pi));
     discoveredAgents = discovery.agents;
 
     if (discoveredAgents.length > 0 && ctx.hasUI) {
@@ -466,6 +482,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         "                             Best for isolated/reproducible work; lower token/cost and less context leakage.",
         "  mode: \"fork\"            -> child gets current session context + your task prompt.",
         "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
+        "  mode: \"continue\"        -> continue a previous lineId checkpoint (single mode only; lineId required).", 
         "",
         'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
         'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
@@ -473,7 +490,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
-        const discovery = discoverAgents(ctx.cwd, "both");
+        const discovery = discoverAgents(ctx.cwd, "both", getAllToolNames(pi));
         const { agents } = discovery;
 
         const delegationMode = parseDelegationMode(params.mode);
@@ -486,7 +503,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
             content: [
               {
                 type: "text",
-                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".\nAvailable agents: ${formatAgentNames(agents)}`,
+                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\", \"fork\", or \"continue\".\nAvailable agents: ${formatAgentNames(agents)}`,
               },
             ],
             details: fallbackDetails("single")([]),
@@ -530,6 +547,44 @@ Use single mode for one task, parallel mode when tasks are independent and can r
               },
             ],
             details: makeDetails("single")([]),
+          };
+        }
+
+        if (delegationMode === "continue") {
+          if (!params.lineId || !params.lineId.trim()) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid parameters: mode=\"continue\" requires lineId. No default line is selected automatically.",
+                },
+              ],
+              details: makeDetails(hasTasks ? "parallel" : "single")([]),
+              isError: true,
+            };
+          }
+          if (hasTasks) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid parameters: mode=\"continue\" currently supports single mode only. Provide agent, task, and lineId.",
+                },
+              ],
+              details: makeDetails("parallel")([]),
+              isError: true,
+            };
+          }
+        } else if (hasTasks && params.lineId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Invalid parameters: top-level lineId is only supported for single mode. Parallel line checkpoints are not implemented yet.",
+              },
+            ],
+            details: makeDetails("parallel")([]),
+            isError: true,
           };
         }
 
@@ -619,9 +674,62 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
         // ── Single mode ──
         if (params.agent && params.task) {
-          return executeSingle(
-            params.agent,
-            params.task,
+          let continueSessionFile: string | undefined;
+          let continuedFrom: { childSessionId: string; childSessionFile?: string; childLeafId?: string } | undefined;
+          let warning: string | undefined;
+          let copyOnWrite = false;
+          let effectiveTask = params.task;
+          const effectiveCwd = params.cwd ?? ctx.cwd;
+          const worktree = getWorktreeFingerprint(effectiveCwd);
+          if (delegationMode === "continue") {
+            const lineId = params.lineId!.trim();
+            const visibleLine = findVisibleLine(ctx.sessionManager.getBranch(), params.agent, lineId);
+            if (!visibleLine) {
+              const available = formatAvailableLines(ctx.sessionManager.getBranch(), params.agent);
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `No line "${lineId}" for agent "${params.agent}" in current branch, or it is outside the latest 3 visible lines.\n\nAvailable lines for this agent in the current branch:\n${available}`,
+                  },
+                ],
+                details: makeDetails("single")([]),
+                isError: true,
+              };
+            }
+            if (!visibleLine.event.childSessionFile) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Cannot continue line "${lineId}" for agent "${params.agent}": the checkpoint is missing childSessionFile. Re-open this line with spawn/fork and lineId to create a resumable checkpoint.`,
+                  },
+                ],
+                details: makeDetails("single")([]),
+                isError: true,
+              };
+            }
+            continueSessionFile = visibleLine.event.childSessionFile;
+            continuedFrom = {
+              childSessionId: visibleLine.event.childSessionId,
+              childSessionFile: visibleLine.event.childSessionFile,
+              childLeafId: visibleLine.event.childLeafId,
+            };
+            if (needsCopyOnWrite(continueSessionFile, visibleLine.event.childLeafId)) {
+              const materialized = materializeCheckpointSnapshot(continueSessionFile, visibleLine.event.childLeafId!);
+              continueSessionFile = materialized.sessionFile;
+              copyOnWrite = true;
+            }
+            if (hasWorktreeDrift(visibleLine.event.worktree, worktree)) {
+              warning = "Worktree drift detected since this subagent line was last used. The task was prefixed with a reminder to re-read files.";
+              effectiveTask = `${WORKTREE_DRIFT_TASK_PREFIX}${effectiveTask}`;
+            }
+          }
+
+          const lineId = params.lineId?.trim();
+          const runSingle = () => executeSingle(
+            params.agent!,
+            effectiveTask,
             params.cwd,
             delegationMode,
             forkSessionSnapshotJsonl,
@@ -630,7 +738,37 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             signal,
             onUpdate,
             makeDetails,
+            lineId,
+            continueSessionFile,
+            continuedFrom,
+            worktree,
+            warning,
+            copyOnWrite,
           );
+
+          if (!lineId) return runSingle();
+
+          const parentHeader = ctx.sessionManager.getHeader();
+          const parentSessionId =
+            parentHeader && typeof parentHeader === "object" && "id" in parentHeader
+              ? String((parentHeader as { id?: unknown }).id ?? "unknown")
+              : "unknown";
+          const lockKey = `${parentSessionId}:${params.agent}:${lineId}`;
+          try {
+            return await withLineLock(lockKey, runSingle);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: message,
+                },
+              ],
+              details: makeDetails("single")([]),
+              isError: true,
+            };
+          }
         }
 
         return {
@@ -665,6 +803,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     signal: AbortSignal | undefined,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
+    lineId?: string,
+    continueSessionFile?: string,
+    continuedFrom?: { childSessionId: string; childSessionFile?: string; childLeafId?: string },
+    worktree?: import("./types.js").WorktreeFingerprint,
+    warning?: string,
+    copyOnWrite?: boolean,
   ) {
     const result = await runAgent({
       cwd: defaultCwd,
@@ -674,6 +818,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       taskCwd: cwd,
       delegationMode,
       forkSessionSnapshotJsonl,
+      continueSessionFile,
+      lineId,
+      continuedFrom,
+      worktree,
+      warning,
+      copyOnWrite,
       parentDepth: currentDepth,
       parentAgentStack: ancestorAgentStack,
       maxDepth,
