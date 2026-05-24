@@ -1,0 +1,8 @@
+{
+  "packages": [
+    {
+      "source": "git:https://github.com/Sanming-BW/pi-subagent",
+      "extensions": []
+    }
+  ]
+}

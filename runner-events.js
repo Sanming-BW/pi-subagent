@@ -14,6 +14,60 @@ function getSeenMessageSignatures(result) {
   return result.__seenMessageSignatures;
 }
 
+function getSeenNestedKeys(result) {
+  if (!Object.prototype.hasOwnProperty.call(result, "__seenNestedKeys")) {
+    Object.defineProperty(result, "__seenNestedKeys", {
+      value: new Set(),
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return result.__seenNestedKeys;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidNestedSingleResult(value) {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.agent !== "string") return false;
+  if (typeof value.task !== "string") return false;
+  if (typeof value.exitCode !== "number") return false;
+  if (!Array.isArray(value.messages)) return false;
+  if (value.nestedDetails !== undefined) {
+    if (!Array.isArray(value.nestedDetails)) return false;
+    if (!value.nestedDetails.every(isValidNestedDetails)) return false;
+  }
+  return true;
+}
+
+function isValidNestedDetails(value) {
+  if (!isPlainObject(value)) return false;
+  if (value.mode !== "single" && value.mode !== "parallel") return false;
+  if (value.delegationMode !== "spawn" && value.delegationMode !== "fork" && value.delegationMode !== "continue") return false;
+  if (!Array.isArray(value.results)) return false;
+  return value.results.every(isValidNestedSingleResult);
+}
+
+function appendNestedDetails(result, event) {
+  if (!event || event.toolName !== "subagent") return false;
+  const details = event.result?.details;
+  if (!isValidNestedDetails(details)) return false;
+
+  const seen = getSeenNestedKeys(result);
+  const key = typeof event.toolCallId === "string" && event.toolCallId
+    ? `id:${event.toolCallId}`
+    : `sig:${stableStringify(details)}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+
+  if (!Array.isArray(result.nestedDetails)) result.nestedDetails = [];
+  result.nestedDetails.push(details);
+  return true;
+}
+
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
@@ -94,6 +148,9 @@ export function processPiEvent(event, result) {
     case "agent_end":
       result.sawAgentEnd = true;
       return addAssistantMessages(result, event.messages);
+
+    case "tool_execution_end":
+      return appendNestedDetails(result, event);
 
     default:
       return false;

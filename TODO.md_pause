@@ -1,0 +1,108 @@
+# TODO
+
+## V1: Subagent viewer
+
+### Config
+
+- [x] Add `config.ts`.
+- [x] Define default config: `{ "viewerKey": "ctrl+m" }` (已改为 alt+o).
+- [x] Read user config from `~/.pi/agent/subagent.json`.
+- [x] Read nearest project config from `.pi/subagent.json`.
+- [x] Merge config with priority: default < user < project.
+- [x] Support `viewerKey: "none"` to disable the shortcut.
+- [x] Warn and fall back safely on invalid JSON or invalid config values.
+
+### Data model
+
+- [x] Add `subagent-view-data.ts`.
+- [x] Extract subagent tool results from `ctx.sessionManager.getBranch()`.
+- [x] Ignore non-subagent tool results.
+- [x] Ignore malformed subagent details safely.
+- [x] Build a root tree node for the current session.
+- [x] Build single subagent calls as agent nodes.
+- [x] Build parallel subagent calls as call nodes with child agent nodes.
+- [x] Compute node status: running, success, error, mixed.
+- [x] Flatten the tree for keyboard navigation.
+- [x] Build detail text for selected agent nodes.
+
+### Viewer UI
+
+- [x] Add `subagent-tree-view.ts`.
+- [x] Implement `openSubagentViewer(ctx)`.
+- [x] Open viewer with `ctx.ui.custom()` in overlay mode.
+- [x] Render tree selection mode.
+- [x] Render detail mode after pressing `Enter`.
+- [x] Show an empty state when there are no subagent records.
+- [x] Truncate/wrap output so rendered lines stay within terminal width.
+
+### Tree navigation
+
+- [x] `↑` selects previous visible node.
+- [x] `↓` selects next visible node.
+- [x] `←` selects parent node.
+- [x] `→` selects first child node.
+- [x] `Home` selects first visible node.
+- [x] `End` selects last visible node.
+- [x] `Enter` opens selected subagent detail.
+- [x] `Esc` closes viewer in tree mode.
+- [x] `q` closes viewer.
+
+### Detail navigation
+
+- [x] `↑` scrolls detail up.
+- [x] `↓` scrolls detail down.
+- [x] `PageUp` scrolls detail up by page.
+- [x] `PageDown` scrolls detail down by page.
+- [x] `Home` jumps to detail top.
+- [x] `End` jumps to detail bottom.
+- [x] `Esc` returns to tree mode.
+- [x] `q` closes viewer.
+
+### Extension integration
+
+- [x] Import config loader and viewer opener in `index.ts`.
+- [x] Install raw terminal shortcut listener on `session_start` when UI is available.
+- [x] Do not use `pi.registerShortcut()`.
+- [x] Do not add `--subagent-view-key`.
+- [x] Add a guard to avoid opening multiple viewers at once.
+- [x] Register `/subagents` command.
+- [x] Keep `/subagents` available even when `viewerKey` is `none`.
+- [x] No-op safely in non-UI modes.
+
+### Packaging and docs
+
+- [x] Add new files to `package.json` `files`.
+- [x] Document `~/.pi/agent/subagent.json`.
+- [x] Document `.pi/subagent.json`.
+- [x] Document `viewerKey` examples.
+- [x] Document `viewerKey: "none"`.
+- [x] Document `/subagents` command.
+- [x] Mention that config changes require `/reload` or restart.
+- [x] Create `pi-subagent-viewer-manual.md` (包含完整更新内容和检验手册).
+
+### Tests
+
+- [x] Add `test/subagent-view-data.test.mjs`.
+- [x] Test empty branch.
+- [x] Test single subagent result.
+- [x] Test parallel subagent result.
+- [x] Test status computation.
+- [x] Test flattened navigation order.
+- [x] Test malformed details are ignored.
+- [x] Optionally add `test/config.test.mjs`.
+- [x] Run `npm test`.
+
+### Manual verification
+
+- [ ] Run `pi -e .`.
+- [ ] Create one single subagent call.
+- [ ] Open viewer with `/subagents`.
+- [ ] Confirm tree selection works.
+- [ ] Press `Enter` and confirm detail opens.
+- [ ] Press `Esc` and confirm it returns to tree.
+- [ ] Press `q` and confirm viewer closes.
+- [ ] Create one parallel subagent call.
+- [ ] Confirm parallel call appears as parent with children.
+- [ ] Configure user `viewerKey` and reload.
+- [ ] Configure project `viewerKey` and confirm it overrides user config.
+- [ ] Set `viewerKey` to `none` and confirm shortcut is disabled.

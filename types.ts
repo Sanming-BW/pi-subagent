@@ -65,6 +65,8 @@ export interface SingleResult {
 	childLeafId?: string;
 	lineEvent?: SubagentLineEvent;
 	warning?: string;
+	/** Subagent tool calls observed inside this child's run (one entry per call). */
+	nestedDetails?: SubagentDetails[];
 }
 
 /** Metadata attached to every tool result for rendering. */

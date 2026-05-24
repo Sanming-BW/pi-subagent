@@ -110,3 +110,87 @@ test("stderr remains a fallback only for error results", () => {
   failedResult.stderr = "warning on stderr";
   assert.equal(getResultSummaryText(failedResult), "warning on stderr");
 });
+
+test("tool_execution_end with toolName=subagent appends nestedDetails and dedupes by toolCallId", () => {
+  const result = makeResult();
+  const details = {
+    mode: "parallel",
+    delegationMode: "spawn",
+    projectAgentsDir: null,
+    results: [
+      {
+        agent: "worker-a",
+        agentSource: "user",
+        task: "do a",
+        exitCode: 0,
+        messages: [],
+        stderr: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 0,
+          turns: 0,
+        },
+      },
+      {
+        agent: "worker-b",
+        agentSource: "user",
+        task: "do b",
+        exitCode: 0,
+        messages: [],
+        stderr: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 0,
+          turns: 0,
+        },
+      },
+    ],
+  };
+
+  const event = {
+    type: "tool_execution_end",
+    toolCallId: "call_42",
+    toolName: "subagent",
+    result: { content: [], details, isError: false },
+  };
+
+  assert.equal(processPiEvent(event, result), true);
+  assert.equal(result.nestedDetails?.length, 1);
+  assert.equal(result.nestedDetails[0].results.length, 2);
+
+  // Same toolCallId again: must not duplicate.
+  assert.equal(processPiEvent(event, result), false);
+  assert.equal(result.nestedDetails.length, 1);
+});
+
+test("tool_execution_end for non-subagent tools is ignored", () => {
+  const result = makeResult();
+  const event = {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "bash",
+    result: { content: [], details: { foo: "bar" }, isError: false },
+  };
+  assert.equal(processPiEvent(event, result), false);
+  assert.equal(result.nestedDetails, undefined);
+});
+
+test("tool_execution_end with malformed subagent details is ignored", () => {
+  const result = makeResult();
+  const event = {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "subagent",
+    result: { content: [], details: { mode: "nope" }, isError: false },
+  };
+  assert.equal(processPiEvent(event, result), false);
+  assert.equal(result.nestedDetails, undefined);
+});

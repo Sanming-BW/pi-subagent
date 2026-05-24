@@ -33,6 +33,57 @@ Rules:
 - Same `parentSessionId + agent + lineId` calls are locked; concurrent open/continue on the same line fails instead of queueing.
 - Copy-on-write continue for child sessions advanced by sibling branches is planned but not implemented yet.
 
+## Subagent viewer
+
+Use `/subagents` to open an overlay viewer for subagent runs recorded in the current session branch. The viewer starts in tree mode, where single subagent calls appear as agent nodes, normal parallel calls appear as a parent node with one child per agent, and zero-result parallel calls appear as `blocked` rows with their recorded reason available in detail view.
+
+Tree keys:
+
+- `↑` / `↓`: select previous or next visible node
+- `←`: select parent node
+- `→`: select first child node
+- `Home` / `End`: jump to first or last visible node
+- `Enter`: open the selected subagent or parallel-call detail
+- `Esc` or `q`: close the viewer
+
+Detail keys:
+
+- `↑` / `↓`: scroll detail output
+- `PageUp` / `PageDown`: scroll by page
+- `Home` / `End`: jump to top or bottom
+- `Esc`: return to the tree
+- `q`: close the viewer
+
+The default shortcut is `ctrl+shift+m`. Configure it with either a user config file:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+or a project config file:
+
+```text
+.pi/subagent.json
+```
+
+Project config overrides user config. Example:
+
+```json
+{
+  "viewerKey": "ctrl+shift+o"
+}
+```
+
+Disable only the shortcut while keeping `/subagents` available:
+
+```json
+{
+  "viewerKey": "none"
+}
+```
+
+Config changes require `/reload` or restarting Pi.
+
 ## tools 语法
 
 `tools` 字段支持一种简单的选择表达式，用来控制子 agent 可用的工具。

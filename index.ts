@@ -8,21 +8,26 @@
  *   - Single:   { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *
- * And two context modes:
+ * Context modes:
  *   - spawn (default): child gets only the task prompt.
  *   - fork: child gets a forked snapshot of current session context + task prompt.
+ *   - continue: resume a single-mode lineId checkpoint.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, discoverAgents } from "./agents.js";
+import { loadSubagentConfig } from "./config.js";
+import { buildForkSessionSnapshotJsonl, type SessionSnapshotSource } from "./fork-snapshot.js";
 import { findVisibleLine, formatAvailableLines } from "./line-history.js";
 import { renderCall, renderResult } from "./render.js";
+import { openSubagentViewer } from "./subagent-tree-view.js";
 import { materializeCheckpointSnapshot, needsCopyOnWrite } from "./session-checkpoint.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { withLineLock } from "./line-lock.js";
 import { mapConcurrent, runAgent } from "./runner.js";
 import { getWorktreeFingerprint, hasWorktreeDrift, WORKTREE_DRIFT_TASK_PREFIX } from "./worktree-fingerprint.js";
+import { matchesKey } from "@mariozechner/pi-tui";
 import {
   type DelegationMode,
   type SingleResult,
@@ -86,15 +91,8 @@ const SubagentParams = Type.Object({
   mode: Type.Optional(
     Type.String({
       description:
-        "Context mode for delegated runs. 'spawn' (default) sends only the task prompt (best for isolated, reproducible runs with lower token/cost and less context leakage). 'fork' adds a snapshot of current session context plus task prompt (best for follow-up work, but usually higher token/cost and may include sensitive context).",
+        "Context mode. Default to 'spawn' for new independent tasks; the child sees only the task prompt, so task must be self-contained. Use 'fork' only when the child needs the current main conversation context. Use 'continue' only to resume a previously created single-mode line with the same agent + lineId; do not use continue for new tasks.",
       default: DEFAULT_DELEGATION_MODE,
-    }),
-  ),
-  confirmProjectAgents: Type.Optional(
-    Type.Boolean({
-      description:
-        "Whether to prompt the user before running project-local agents. Default: true.",
-      default: true,
     }),
   ),
   cwd: Type.Optional(
@@ -105,7 +103,7 @@ const SubagentParams = Type.Object({
   lineId: Type.Optional(
     Type.String({
       description:
-        "Optional reusable subagent line id. Required for mode='continue'. With spawn/fork, records a checkpoint for later continue.",
+        "Caller-chosen reusable line id. Add to spawn/fork to create a checkpoint; required with mode='continue' to resume it."
     }),
   ),
 });
@@ -122,11 +120,6 @@ interface DelegationDepthConfig {
   preventCycles: boolean;
 }
 
-interface SessionSnapshotSource {
-  getHeader: () => unknown;
-  getBranch: () => unknown[];
-}
-
 function parseDelegationMode(raw: unknown): DelegationMode | null {
   if (raw === undefined) return DEFAULT_DELEGATION_MODE;
   if (typeof raw !== "string") return null;
@@ -135,18 +128,6 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
     return normalized;
   }
   return null;
-}
-
-function buildForkSessionSnapshotJsonl(
-  sessionManager: SessionSnapshotSource,
-): string | null {
-  const header = sessionManager.getHeader();
-  if (!header || typeof header !== "object") return null;
-
-  const branchEntries = sessionManager.getBranch();
-  const lines = [JSON.stringify(header)];
-  for (const entry of branchEntries) lines.push(JSON.stringify(entry));
-  return `${lines.join("\n")}\n`;
 }
 
 function parseNonNegativeInt(raw: unknown): number | null {
@@ -351,40 +332,27 @@ function getCycleViolations(
   return Array.from(requestedNames).filter((name) => stackSet.has(name));
 }
 
-/** Get project-local agents referenced by the current request. */
-function getRequestedProjectAgents(
-  agents: AgentConfig[],
-  requestedNames: Set<string>,
-): AgentConfig[] {
-  return Array.from(requestedNames)
-    .map((name) => agents.find((a) => a.name === name))
-    .filter((a): a is AgentConfig => a?.source === "project");
-}
-
-/**
- * Prompt the user to confirm project-local agents if needed.
- * Returns false if the user declines.
- */
-async function confirmProjectAgentsIfNeeded(
-  projectAgents: AgentConfig[],
-  projectAgentsDir: string | null,
-  ctx: { ui: { confirm: (title: string, body: string) => Promise<boolean> } },
-): Promise<boolean> {
-  if (projectAgents.length === 0) return true;
-
-  const names = projectAgents.map((a) => a.name).join(", ");
-  const dir = projectAgentsDir ?? "(unknown)";
-  return ctx.ui.confirm(
-    "Run project-local agents?",
-    `Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  let viewerOpen = false;
+
+  async function guardedOpenSubagentViewer(ctx: { hasUI?: boolean; ui?: { notify?: (message: string, level?: string) => void }; sessionManager: SessionSnapshotSource; cwd: string }): Promise<void> {
+    if (!ctx.hasUI) return;
+    if (viewerOpen) return;
+    viewerOpen = true;
+    try {
+      await openSubagentViewer(ctx as any);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui?.notify?.(`Subagent viewer failed: ${message}`, "error");
+    } finally {
+      viewerOpen = false;
+    }
+  }
+
   pi.registerFlag("subagent-max-depth", {
     description: "Maximum allowed subagent delegation depth (default: 3).",
     type: "string",
@@ -401,8 +369,31 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
 
+  pi.registerCommand("subagents", {
+    description: "Open subagent viewer",
+    handler: async (_args, ctx) => {
+      await guardedOpenSubagentViewer(ctx as any);
+    },
+  });
+
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    if (ctx.hasUI) {
+      const config = loadSubagentConfig(ctx.cwd);
+      const ui = ctx.ui as typeof ctx.ui & {
+        onTerminalInput?: (handler: (data: string) => { consume: boolean } | undefined) => void;
+      };
+      if (config.viewerKey !== "none" && typeof ui.onTerminalInput === "function") {
+        const viewerKey = config.viewerKey;
+        ui.onTerminalInput((data: string) => {
+          if (viewerOpen) return undefined;
+          if (!matchesKey(data, viewerKey)) return undefined;
+          void guardedOpenSubagentViewer(ctx as any);
+          return { consume: true };
+        });
+      }
+    }
+
     if (!canDelegate) return;
 
     const discovery = discoverAgents(ctx.cwd, "both", getAllToolNames(pi));
@@ -441,12 +432,19 @@ ${agentList}
 Each subagent runs in an **isolated process**.
 
 Context behavior is controlled by optional 'mode':
-- 'spawn' (default): child receives only the provided task prompt. Best for isolated, reproducible tasks with lower token/cost and less context leakage.
-- 'fork': child receives a forked snapshot of current session context plus the task prompt. Best for follow-up tasks that rely on prior context; usually higher token/cost and may include sensitive context.
+- 'spawn' (default): child receives only the provided task prompt.
+- 'fork': child receives a forked snapshot of current session context plus the task prompt.
+- 'continue': resume a previous single-mode checkpoint by agent + lineId.
 
 **Single mode** — delegate one task:
 \`\`\`json
 { "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
+\`\`\`
+
+**Reusable line** — choose your own lineId on spawn/fork if you may continue later:
+\`\`\`json
+{ "agent": "agent-name", "mode": "spawn", "lineId": "short-stable-name", "task": "Start work..." }
+{ "agent": "agent-name", "mode": "continue", "lineId": "short-stable-name", "task": "Continue work..." }
 \`\`\`
 
 **Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task):
@@ -454,7 +452,7 @@ Context behavior is controlled by optional 'mode':
 { "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
 \`\`\`
 
-Use single mode for one task, parallel mode when tasks are independent and can run simultaneously.
+Use single mode for one task, parallel mode when tasks are independent. lineId is caller-chosen, not generated automatically, and top-level lineId is single-mode only.
 
 ### Runtime delegation guards
 
@@ -482,9 +480,13 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         "                             Best for isolated/reproducible work; lower token/cost and less context leakage.",
         "  mode: \"fork\"            -> child gets current session context + your task prompt.",
         "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
-        "  mode: \"continue\"        -> continue a previous lineId checkpoint (single mode only; lineId required).", 
+        "  mode: \"continue\"        -> continue a previous lineId checkpoint (single mode only; lineId required).",
+        "",
+        "lineId: caller-chosen reusable name. Add it to spawn/fork to create a checkpoint; reuse it with mode=\"continue\".",
         "",
         'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
+        'Example line:     { agent: "writer", mode: "spawn", lineId: "readme", task: "Start README work" }',
+        'Example continue: { agent: "writer", mode: "continue", lineId: "readme", task: "Continue README work" }',
         'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
       ].join("\n"),
       parameters: SubagentParams,
@@ -588,7 +590,6 @@ Use single mode for one task, parallel mode when tasks are independent and can r
           };
         }
 
-        // Security: guard project-local agents before running
         const requested = new Set<string>();
         if (params.tasks) for (const t of params.tasks) requested.add(t.agent);
         if (params.agent) requested.add(params.agent);
@@ -611,45 +612,6 @@ Use single mode for one task, parallel mode when tasks are independent and can r
 Current stack: ${stackText}
 
 This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A).`,
-                },
-              ],
-              details: makeDetails(hasTasks ? "parallel" : "single")([]),
-              isError: true,
-            };
-          }
-        }
-
-        const requestedProjectAgents = getRequestedProjectAgents(
-          agents,
-          requested,
-        );
-        const shouldConfirmProjectAgents = params.confirmProjectAgents ?? true;
-        if (requestedProjectAgents.length > 0 && shouldConfirmProjectAgents) {
-          if (ctx.hasUI) {
-            const approved = await confirmProjectAgentsIfNeeded(
-              requestedProjectAgents,
-              discovery.projectAgentsDir,
-              ctx,
-            );
-            if (!approved) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Canceled: project-local agents not approved.",
-                  },
-                ],
-                details: makeDetails(hasTasks ? "parallel" : "single")([]),
-              };
-            }
-          } else {
-            const names = requestedProjectAgents.map((a) => a.name).join(", ");
-            const dir = discovery.projectAgentsDir ?? "(unknown)";
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Blocked: project-local agent confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRe-run with confirmProjectAgents: false only if this repository is trusted.`,
                 },
               ],
               details: makeDetails(hasTasks ? "parallel" : "single")([]),

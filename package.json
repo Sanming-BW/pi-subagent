@@ -7,6 +7,10 @@
   "files": [
     "index.ts",
     "agents.ts",
+    "config.ts",
+    "fork-snapshot.ts",
+    "subagent-view-data.ts",
+    "subagent-tree-view.ts",
     "runner.ts",
     "runner-cli.js",
     "runner-events.js",
@@ -48,15 +52,20 @@
   },
   "license": "MIT",
   "devDependencies": {
+    "@mariozechner/pi-agent-core": "^0.73.1",
+    "@mariozechner/pi-ai": "^0.73.1",
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@mariozechner/pi-tui": "^0.73.1",
+    "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.2.3",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": ">=0.37.0",
-    "@mariozechner/pi-ai": ">=0.37.0",
-    "@mariozechner/pi-coding-agent": ">=0.37.0",
-    "@mariozechner/pi-tui": ">=0.37.0",
-    "@sinclair/typebox": ">=0.34.0"
+    "@mariozechner/pi-agent-core": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "@mariozechner/pi-coding-agent": "latest",
+    "@mariozechner/pi-tui": "latest",
+    "@sinclair/typebox": "latest"
   },
   "peerDependenciesMeta": {
     "@mariozechner/pi-agent-core": {
