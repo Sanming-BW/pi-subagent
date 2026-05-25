@@ -6,7 +6,11 @@ If you come here, you probably have lost your way.
 
 ## Active agent mode
 
-This extension now supports a main-session **active agent** that changes the model, thinking level, tools, and system prompt for future turns only.
+This extension supports a main-session **active agent** that changes the model, thinking level, tools, and system prompt for future turns only.
+
+When an active agent is selected, its prompt becomes the primary system prompt for future turns. Pi's default coding-agent persona is replaced by the active agent's identity and instructions, while operational context is rebuilt from Pi's structured prompt options: selected tool descriptions, guidelines, visible subagent instructions, project context files, skills when the `read` tool is active, current date, and current working directory.
+
+Explicit custom system prompts and appended system prompts are preserved as additional instructions after the active-agent prompt. If no active agent is selected, prompt behavior is unchanged: Pi builds its normal system prompt and this extension appends the available-subagents section as before.
 
 ### Start with an agent
 

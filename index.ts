@@ -15,7 +15,12 @@
  */
 
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+  formatSkillsForPrompt,
+  type BuildSystemPromptOptions,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
 import { matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -459,6 +464,219 @@ function getCycleViolations(
   return Array.from(requestedNames).filter((name) => stackSet.has(name));
 }
 
+interface AvailableSubagentsSectionOptions {
+  visibleAgents: AgentConfig[];
+  currentDepth: number;
+  maxDepth: number;
+  preventCycles: boolean;
+  ancestorAgentStack: string[];
+}
+
+function buildAvailableSubagentsSection({
+  visibleAgents,
+  currentDepth,
+  maxDepth,
+  preventCycles,
+  ancestorAgentStack,
+}: AvailableSubagentsSectionOptions): string | undefined {
+  if (visibleAgents.length === 0) return undefined;
+
+  const agentList = visibleAgents
+    .map((a) => `- **${a.name}**: ${a.description}`)
+    .join("\n");
+
+  return `## Available Subagents
+
+The following subagents are available via the \`subagent\` tool:
+
+${agentList}
+
+### How to call the subagent tool
+
+Each subagent runs in an **isolated process**.
+
+Context behavior is controlled by optional 'mode':
+- 'spawn' (default): child receives only the provided task prompt.
+- 'fork': child receives a forked snapshot of current session context plus the task prompt.
+- 'continue': resume a previous single-mode checkpoint by agent + lineId.
+
+**Single mode** — delegate one task:
+\`\`\`json
+{ "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
+\`\`\`
+
+**Reusable line** — choose your own lineId on spawn/fork if you may continue later:
+\`\`\`json
+{ "agent": "agent-name", "mode": "spawn", "lineId": "short-stable-name", "task": "Start work..." }
+{ "agent": "agent-name", "mode": "continue", "lineId": "short-stable-name", "task": "Continue work..." }
+\`\`\`
+
+**Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task):
+\`\`\`json
+{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
+\`\`\`
+
+Use single mode for one task, parallel mode when tasks are independent. lineId is caller-chosen, not generated automatically, and top-level lineId is single-mode only.
+
+### Runtime delegation guards
+
+- Max depth: current depth ${currentDepth}, max depth ${maxDepth}
+- Cycle prevention: ${preventCycles ? "enabled" : "disabled"}
+- Current delegation stack: ${ancestorAgentStack.length > 0 ? ancestorAgentStack.join(" -> ") : "(root)"}`;
+}
+
+function trimmedNonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function buildActiveAgentSection(agent: AgentConfig): string {
+  const body = trimmedNonEmpty(agent.systemPrompt);
+  return body ? `# Active Agent: ${agent.name}\n\n${body}` : `# Active Agent: ${agent.name}`;
+}
+
+function buildUserPromptAdditions(options: BuildSystemPromptOptions): string | undefined {
+  const sections: string[] = [];
+  const customPrompt = trimmedNonEmpty(options.customPrompt);
+  if (customPrompt) {
+    sections.push(`## Additional System Prompt\n\n${customPrompt}`);
+  }
+
+  const appendSystemPrompt = trimmedNonEmpty(options.appendSystemPrompt);
+  if (appendSystemPrompt) {
+    sections.push(`## Appended System Prompt\n\n${appendSystemPrompt}`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : undefined;
+}
+
+function getSelectedTools(options: BuildSystemPromptOptions): string[] {
+  return options.selectedTools ?? [];
+}
+
+function getGuidelineTools(options: BuildSystemPromptOptions): string[] {
+  return options.selectedTools ?? ["read", "bash", "edit", "write"];
+}
+
+function buildAvailableToolsSection(options: BuildSystemPromptOptions): string {
+  const selectedTools = getSelectedTools(options);
+  const toolSnippets = options.toolSnippets ?? {};
+  const visibleTools = selectedTools
+    .map((name) => ({ name, snippet: trimmedNonEmpty(toolSnippets[name]) }))
+    .filter((tool): tool is { name: string; snippet: string } => Boolean(tool.snippet));
+  const toolsList = visibleTools.length > 0
+    ? visibleTools.map(({ name, snippet }) => `- ${name}: ${snippet}`).join("\n")
+    : "(none)";
+
+  return `## Available tools\n\n${toolsList}`;
+}
+
+function buildGuidelinesSection(options: BuildSystemPromptOptions): string {
+  const tools = getGuidelineTools(options);
+  const guidelines: string[] = [];
+  const seen = new Set<string>();
+  const addGuideline = (guideline: string) => {
+    const normalized = guideline.trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    guidelines.push(normalized);
+  };
+
+  const hasBash = tools.includes("bash");
+  const hasGrep = tools.includes("grep");
+  const hasFind = tools.includes("find");
+  const hasLs = tools.includes("ls");
+
+  if (hasBash && !hasGrep && !hasFind && !hasLs) {
+    addGuideline("Use bash for file operations like ls, rg, find");
+  } else if (hasBash && (hasGrep || hasFind || hasLs)) {
+    addGuideline("Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)");
+  }
+
+  for (const guideline of options.promptGuidelines ?? []) {
+    addGuideline(guideline);
+  }
+
+  addGuideline("Be concise in your responses");
+  addGuideline("Show file paths clearly when working with files");
+
+  return `## Guidelines\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function buildProjectContextSection(options: BuildSystemPromptOptions): string | undefined {
+  const contextFiles = options.contextFiles ?? [];
+  if (contextFiles.length === 0) return undefined;
+
+  const fileSections = contextFiles
+    .map(({ path: filePath, content }) => `<project_instructions path="${escapeXmlAttribute(filePath)}">\n${content}\n</project_instructions>`)
+    .join("\n\n");
+
+  return `<project_context>\n\nProject-specific instructions and guidelines:\n\n${fileSections}\n\n</project_context>`;
+}
+
+function buildSkillsSection(options: BuildSystemPromptOptions): string | undefined {
+  const skills = options.skills ?? [];
+  if (skills.length === 0) return undefined;
+  const hasRead = !options.selectedTools || options.selectedTools.includes("read");
+  if (!hasRead) return undefined;
+
+  const formatted = formatSkillsForPrompt(skills).trim();
+  return formatted.length > 0 ? formatted : undefined;
+}
+
+function getCurrentDateString(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function buildDateCwdSection(cwd: string): string {
+  const promptCwd = (cwd || process.cwd()).replace(/\\/g, "/");
+  return `Current date: ${getCurrentDateString()}\nCurrent working directory: ${promptCwd}`;
+}
+
+function shouldIncludeSubagentsInActivePrompt(options: BuildSystemPromptOptions): boolean {
+  return !options.selectedTools || options.selectedTools.includes("subagent");
+}
+
+function buildActiveAgentSystemPrompt(input: {
+  agent: AgentConfig;
+  visibleAgents: AgentConfig[];
+  systemPromptOptions: BuildSystemPromptOptions;
+  subagentsSectionOptions: Omit<AvailableSubagentsSectionOptions, "visibleAgents">;
+}): string {
+  const { agent, visibleAgents, systemPromptOptions, subagentsSectionOptions } = input;
+  const subagentsSection = shouldIncludeSubagentsInActivePrompt(systemPromptOptions)
+    ? buildAvailableSubagentsSection({
+      ...subagentsSectionOptions,
+      visibleAgents,
+    })
+    : undefined;
+
+  const sections = [
+    buildActiveAgentSection(agent),
+    buildUserPromptAdditions(systemPromptOptions),
+    buildAvailableToolsSection(systemPromptOptions),
+    buildGuidelinesSection(systemPromptOptions),
+    subagentsSection,
+    buildProjectContextSection(systemPromptOptions),
+    buildSkillsSection(systemPromptOptions),
+    buildDateCwdSection(systemPromptOptions.cwd),
+  ];
+
+  return sections.filter((section): section is string => Boolean(section)).join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -669,65 +887,37 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Inject available agents into the system prompt
+  // Inject available agents into the system prompt, or replace it for active-agent mode.
   pi.on("before_agent_start", async (event) => {
     if (!canDelegate) return;
     const visibleAgents = getVisibleDiscoveredAgents();
-    if (visibleAgents.length === 0 && !activeAgentState.activeAgent) return;
 
-    const sections: string[] = [];
-    if (visibleAgents.length > 0) {
-      const agentList = visibleAgents
-        .map((a) => `- **${a.name}**: ${a.description}`)
-        .join("\n");
-      sections.push(`## Available Subagents
-
-The following subagents are available via the \`subagent\` tool:
-
-${agentList}
-
-### How to call the subagent tool
-
-Each subagent runs in an **isolated process**.
-
-Context behavior is controlled by optional 'mode':
-- 'spawn' (default): child receives only the provided task prompt.
-- 'fork': child receives a forked snapshot of current session context plus the task prompt.
-- 'continue': resume a previous single-mode checkpoint by agent + lineId.
-
-**Single mode** — delegate one task:
-\`\`\`json
-{ "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
-\`\`\`
-
-**Reusable line** — choose your own lineId on spawn/fork if you may continue later:
-\`\`\`json
-{ "agent": "agent-name", "mode": "spawn", "lineId": "short-stable-name", "task": "Start work..." }
-{ "agent": "agent-name", "mode": "continue", "lineId": "short-stable-name", "task": "Continue work..." }
-\`\`\`
-
-**Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task):
-\`\`\`json
-{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
-\`\`\`
-
-Use single mode for one task, parallel mode when tasks are independent. lineId is caller-chosen, not generated automatically, and top-level lineId is single-mode only.
-
-### Runtime delegation guards
-
-- Max depth: current depth ${currentDepth}, max depth ${maxDepth}
-- Cycle prevention: ${preventCycles ? "enabled" : "disabled"}
-- Current delegation stack: ${ancestorAgentStack.length > 0 ? ancestorAgentStack.join(" -> ") : "(root)"}`);
-    }
+    const subagentsSectionOptions = {
+      currentDepth,
+      maxDepth,
+      preventCycles,
+      ancestorAgentStack,
+    };
 
     if (activeAgentState.activeAgent) {
-      sections.push(`## Active Agent: ${activeAgentState.activeAgent.name}
-
-${activeAgentState.activeAgent.systemPrompt}`);
+      return {
+        systemPrompt: buildActiveAgentSystemPrompt({
+          agent: activeAgentState.activeAgent,
+          visibleAgents,
+          systemPromptOptions: event.systemPromptOptions,
+          subagentsSectionOptions,
+        }),
+      };
     }
 
+    const availableSubagentsSection = buildAvailableSubagentsSection({
+      ...subagentsSectionOptions,
+      visibleAgents,
+    });
+    if (!availableSubagentsSection) return;
+
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${sections.join("\n\n")}`,
+      systemPrompt: `${event.systemPrompt}\n\n${availableSubagentsSection}`,
     };
   });
 

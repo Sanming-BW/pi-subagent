@@ -1,286 +1,489 @@
-# REFERENCE — Default active agent config
+# REFERENCE — Active agent prompt override
 
-This document defines the intended behavior for adding a `defaultAgent` configuration option to the Pi subagent extension.
+This document defines the intended behavior for changing main-session active-agent prompt handling in the Pi subagent extension.
 
 ## Problem
 
-The extension already supports selecting a main-session active agent using:
+The extension currently supports a main-session **active agent**. Selecting an active agent can change:
 
-```bash
-pi --agent plan
-```
+- model
+- thinking level
+- active tools
+- system prompt instructions
 
-and switching interactively with:
+However, the active-agent prompt is currently appended after Pi's default coding-agent system prompt. That means a specialized agent such as `plan` still receives Pi's generic coding-assistant persona first, then receives the active-agent persona later.
+
+Current effective shape:
 
 ```text
-/agent plan
+You are an expert coding assistant operating inside pi...
+Available tools...
+Guidelines...
+Project context...
+Skills...
+Current date/cwd...
+
+Available Subagents...
+
+Active Agent: plan
+You are a planning assistant...
 ```
 
-However, repeatedly typing `--agent plan` is inconvenient when a user wants the same agent to be active every time they enter a project or start Pi.
+This can dilute the active agent's role. For example, a planning agent whose prompt says "do not modify code" is preceded by Pi's default prompt saying the assistant can edit and write files.
 
 ## Goal
 
-Allow users to configure a default active agent once, then start Pi normally.
+When an active agent is selected, the active agent's prompt should become the primary system prompt.
 
-Example desired flow:
-
-```json
-// .pi/subagent.json
-{
-  "defaultAgent": "plan"
-}
-```
-
-Then:
-
-```bash
-pi
-```
-
-starts with `plan` already active.
-
-## Config files
-
-Reuse the existing subagent extension config files.
-
-### User config
+Target effective shape:
 
 ```text
-~/.pi/agent/subagent.json
+Active Agent: plan
+You are a planning assistant...
+
+Available tools...
+Guidelines...
+Available Subagents...
+Project context...
+Skills...
+Current date/cwd...
 ```
 
-Applies globally unless overridden by project config.
+The active-agent prompt should replace Pi's generic coding-agent persona, while preserving the operational context required to use Pi correctly.
 
-### Project config
+## API basis
+
+Pi extensions can modify or replace the system prompt in the `before_agent_start` event:
+
+```ts
+pi.on("before_agent_start", async (event, ctx) => {
+  return {
+    systemPrompt: "replacement prompt for this turn",
+  };
+});
+```
+
+Important event fields:
+
+```ts
+event.systemPrompt
+```
+
+The fully assembled prompt Pi would normally send, including changes from earlier `before_agent_start` handlers.
+
+```ts
+event.systemPromptOptions
+```
+
+Structured inputs used by Pi to build the prompt. This is the preferred source for rebuilding selected prompt sections.
+
+Relevant `systemPromptOptions` fields:
+
+- `customPrompt?: string`
+- `selectedTools?: string[]`
+- `toolSnippets?: Record<string, string>`
+- `promptGuidelines?: string[]`
+- `appendSystemPrompt?: string`
+- `cwd: string`
+- `contextFiles?: Array<{ path: string; content: string }>`
+- `skills?: Skill[]`
+
+## Core behavior
+
+### No active agent
+
+If no active agent is selected, behavior should remain unchanged.
+
+The extension may keep appending its subagent information to `event.systemPrompt` as it does today.
+
+### Active agent selected
+
+If `activeAgentState.activeAgent` is set, the extension should return a replacement prompt.
+
+The replacement prompt should:
+
+- start with the active-agent identity and `agent.systemPrompt`
+- not include Pi's default coding-agent persona from `event.systemPrompt`
+- preserve useful runtime context from `event.systemPromptOptions`
+- include available subagent information when the `subagent` tool is active
+- preserve project instructions and skills
+- end with current date and current working directory
+
+## Recommended prompt order
+
+Use this order in active-agent override mode.
+
+### 1. Active agent section
+
+Example:
+
+```markdown
+# Active Agent: plan
+
+You are a planning assistant. Your goal is to understand the codebase, analyze requirements, and create clear implementation plans. You do not modify code.
+```
+
+The body is the markdown body of the selected agent file.
+
+### 2. User/system additions
+
+If Pi loaded a custom system prompt or appended system prompt, preserve it as additional instructions.
+
+Suggested shape:
+
+```markdown
+## Additional System Prompt
+
+<systemPromptOptions.customPrompt>
+```
+
+```markdown
+## Appended System Prompt
+
+<systemPromptOptions.appendSystemPrompt>
+```
+
+Rationale: active-agent override should not silently drop explicit user configuration, but these additions should not precede the active-agent identity.
+
+### 3. Available tools
+
+Use `systemPromptOptions.selectedTools` and `systemPromptOptions.toolSnippets`.
+
+Suggested shape:
+
+```markdown
+## Available tools
+
+- read: Read file contents
+- grep: Search file contents
+- subagent: Delegate work to specialized subagents
+```
+
+Rules:
+
+- Only include active selected tools.
+- Only include tools that have a snippet.
+- If no selected active tool has a snippet, show `(none)`.
+- Do not infer tool availability from all registered tools.
+
+### 4. Guidelines
+
+Preserve the useful default Pi guidance while avoiding the generic coding persona.
+
+Recommended guideline logic:
+
+- If `bash` is active and none of `grep`, `find`, or `ls` is active:
+  - `Use bash for file operations like ls, rg, find`
+- If `bash` and any of `grep`, `find`, or `ls` are active:
+  - `Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)`
+- Include non-empty `systemPromptOptions.promptGuidelines`.
+- Include:
+  - `Be concise in your responses`
+  - `Show file paths clearly when working with files`
+
+Deduplicate exact repeated guidelines while preserving first occurrence.
+
+### 5. Available subagents
+
+The extension currently injects a custom `Available Subagents` section because the `subagent` tool needs more usage guidance than a one-line tool snippet.
+
+In active-agent override mode, include this section when:
+
+- visible agents exist, and
+- the `subagent` tool is active, or `selectedTools` is absent/unknown
+
+The section should include:
+
+- visible subagent list
+- exact `subagent` invocation shapes
+- `spawn`, `fork`, and `continue` mode explanation
+- `lineId` explanation
+- parallel invocation notes
+- runtime delegation guard status
+
+Hidden agents remain excluded from this discovery-oriented list.
+
+### 6. Project context
+
+Preserve `systemPromptOptions.contextFiles`.
+
+A stable wrapper format is recommended:
+
+```xml
+<project_context>
+
+Project-specific instructions and guidelines:
+
+<project_instructions path="/path/to/AGENTS.md">
+...
+</project_instructions>
+
+</project_context>
+```
+
+This mirrors newer Pi prompt style and keeps file paths explicit.
+
+### 7. Skills
+
+Preserve loaded skills from `systemPromptOptions.skills`.
+
+Rules:
+
+- Include skills only when `read` is active.
+- Prefer using Pi's `formatSkillsForPrompt(skills)` export.
+- If compatibility requires a local fallback, keep the same basic meaning: expose skill name, description, and instruction to read `SKILL.md` when relevant.
+
+Rationale: Pi's skills are progressive-disclosure. The prompt should advertise available skills, but full skill content should still be loaded with `read` only when needed.
+
+### 8. Current date and cwd
+
+End with:
 
 ```text
-.pi/subagent.json
+Current date: YYYY-MM-DD
+Current working directory: /path/to/cwd
 ```
 
-Discovered by walking upward from the current working directory.
+Use the same date format and cwd normalization as Pi's prompt builder.
 
-Project config overrides user config.
+## Relationship to active tools
 
-## Config shape
-
-Extend the existing config shape from:
-
-```ts
-interface SubagentExtensionConfig {
-  viewerKey: KeyId | "none";
-}
-```
-
-to:
-
-```ts
-interface SubagentExtensionConfig {
-  viewerKey: KeyId | "none";
-  defaultAgent?: string;
-}
-```
-
-`viewerKey` behavior must remain unchanged.
-
-## Example configs
-
-### Project-local default active agent
-
-```json
-{
-  "viewerKey": "ctrl+k",
-  "defaultAgent": "plan"
-}
-```
-
-### User-global default active agent
-
-```json
-{
-  "defaultAgent": "plan"
-}
-```
-
-### Disable viewer shortcut while keeping default agent
-
-```json
-{
-  "viewerKey": "none",
-  "defaultAgent": "plan"
-}
-```
-
-## Startup precedence
-
-Startup active-agent selection should use this precedence:
-
-1. CLI flag `--agent <name>`
-2. Project config `.pi/subagent.json` `defaultAgent`
-3. User config `~/.pi/agent/subagent.json` `defaultAgent`
-4. No active agent
-
-This means CLI always wins:
-
-```bash
-pi --agent worker
-```
-
-should activate `worker` even if config says:
-
-```json
-{
-  "defaultAgent": "plan"
-}
-```
-
-## Exact-name rule
-
-`defaultAgent` is an exact-name operation.
-
-It should resolve against the full discovered agent set, including hidden agents.
-
-Examples:
-
-```json
-{
-  "defaultAgent": "oracle"
-}
-```
-
-should work even if the `oracle` agent has:
+Active-agent frontmatter may define tools:
 
 ```yaml
-hidden: true
+tools: read,bash,grep,find,ls
 ```
 
-## Missing agent behavior
+The existing `applyActiveAgent()` behavior already calls:
 
-If `defaultAgent` is configured but the agent does not exist:
-
-- show a warning
-- continue without an active agent
-- do not crash startup
-
-Suggested warning:
-
-```text
-Unknown default agent: plan
+```ts
+pi.setActiveTools(agent.tools)
 ```
 
-or, if sharing logic with `--agent`:
+This should remain unchanged.
 
-```text
-Unknown agent: plan
+Prompt generation should describe the currently selected tools from `systemPromptOptions.selectedTools`; it should not independently apply or change tools.
+
+## Relationship to model and thinking
+
+Active-agent frontmatter may define:
+
+```yaml
+model: openai/gpt-5.2
+thinking: high
 ```
 
-## Empty or invalid config values
+Existing model and thinking behavior should remain unchanged.
 
-### Empty string
+The prompt override should not change:
 
-Ignore empty strings after trimming:
+- `resolveModelReference()`
+- `pi.setModel()` calls
+- `pi.setThinkingLevel()` calls
+- baseline restore behavior
 
-```json
-{
-  "defaultAgent": ""
+## Relationship to `customPrompt`
+
+Pi's `customPrompt` normally replaces Pi's default prompt while still appending project context, skills, date, and cwd.
+
+In active-agent override mode, the active agent is the primary persona. Therefore:
+
+- `agent.systemPrompt` should come first.
+- `customPrompt` should be preserved as additional system instructions after the agent prompt.
+- `customPrompt` should not replace the active-agent prompt.
+
+This avoids surprising users who explicitly selected an active agent.
+
+## Relationship to `appendSystemPrompt`
+
+`appendSystemPrompt` should be preserved after the active-agent prompt, before operational context.
+
+It should not be duplicated.
+
+## Relationship to other extensions
+
+`before_agent_start` handlers are chained. `event.systemPrompt` reflects modifications from earlier handlers.
+
+This feature intentionally rebuilds from `systemPromptOptions` when active agent is selected. That means it may discard earlier extensions' string-only modifications if those modifications only changed `event.systemPrompt` and did not alter structured options.
+
+Recommended policy for this repository:
+
+- Accept this limitation for now.
+- Document that active-agent override mode prioritizes the active agent prompt and Pi's structured prompt context.
+- If preserving arbitrary earlier extension modifications becomes important, add an opt-in compatibility mode later.
+
+## Implementation sketch
+
+```ts
+import type { BuildSystemPromptOptions } from "@mariozechner/pi-coding-agent";
+import { formatSkillsForPrompt } from "@mariozechner/pi-coding-agent";
+
+function buildActiveAgentSystemPrompt(input: {
+  agent: AgentConfig;
+  visibleAgents: AgentConfig[];
+  systemPromptOptions: BuildSystemPromptOptions;
+}): string {
+  const { agent, visibleAgents, systemPromptOptions } = input;
+
+  const sections = [
+    buildActiveAgentSection(agent),
+    buildUserPromptAdditions(systemPromptOptions),
+    buildToolsSection(systemPromptOptions),
+    buildGuidelinesSection(systemPromptOptions),
+    buildAvailableSubagentsSection(visibleAgents, systemPromptOptions),
+    buildProjectContextSection(systemPromptOptions),
+    buildSkillsSection(systemPromptOptions),
+    buildDateCwdSection(systemPromptOptions.cwd),
+  ];
+
+  return sections.filter(Boolean).join("\n\n");
 }
 ```
 
-This should behave as if no default agent was configured.
-
-### Non-string value
-
-Warn and ignore:
-
-```json
-{
-  "defaultAgent": true
-}
-```
-
-Suggested warning:
-
-```text
-Ignoring project defaultAgent: expected a string.
-```
-
-## Relationship to hidden agents
-
-Hidden agents are excluded from discovery-oriented UI, such as:
-
-- `/agent` selector
-- `/agent` completions
-- cycle order
-- startup visible-agent notification
-- prompt-level visible-agent list
-
-But hidden agents remain callable by exact name.
-
-`defaultAgent` follows exact-name behavior, so it may activate hidden agents.
-
-## Relationship to child subagents
-
-This feature applies to the **main Pi session**.
-
-Child subagents already use their own agent markdown files as their execution config.
-
-Important intended behavior:
-
-- `--agent <name>` must not be forwarded to child subagent processes.
-- `defaultAgent` should not conceptually alter child subagent execution.
-
-Because `defaultAgent` lives in `.pi/subagent.json`, child Pi processes running in the same cwd may also load the extension config. If that causes unintended active-agent injection inside child sessions, implementation should prevent it by one of these approaches:
-
-1. Ignore `defaultAgent` when `PI_SUBAGENT_DEPTH > 0`.
-2. Or skip applying `defaultAgent` when running in child subagent mode.
-3. Or document that child active-agent state is harmless because child prompts already receive their own agent config.
-
-Recommended behavior: **ignore `defaultAgent` for child subagent processes** so parent convenience config does not affect child behavior.
-
-## Recommended implementation detail
-
-During `session_start`:
+Then in the existing handler:
 
 ```ts
-const config = loadSubagentConfig(ctx.cwd);
-const cliAgent = pi.getFlag("agent");
-const requestedAgent =
-  typeof cliAgent === "string" && cliAgent.trim()
-    ? cliAgent.trim()
-    : config.defaultAgent;
+pi.on("before_agent_start", async (event) => {
+  if (!canDelegate) return;
+
+  const visibleAgents = getVisibleDiscoveredAgents();
+
+  if (activeAgentState.activeAgent) {
+    return {
+      systemPrompt: buildActiveAgentSystemPrompt({
+        agent: activeAgentState.activeAgent,
+        visibleAgents,
+        systemPromptOptions: event.systemPromptOptions,
+      }),
+    };
+  }
+
+  // Existing append behavior when no active agent.
+});
 ```
-
-Then resolve `requestedAgent` by exact name from all discovered agents.
-
-To avoid affecting child subagent runs, apply config default only when current delegation depth is root:
-
-```ts
-const isRootSession = currentDepth === 0;
-const requestedAgent = cliAgent || (isRootSession ? config.defaultAgent : undefined);
-```
-
-CLI `--agent` should still work wherever explicitly supplied, but parent `--agent` is already stripped from child processes.
 
 ## Acceptance criteria
 
 A correct implementation satisfies all of the following:
 
-- `defaultAgent` can be configured in `~/.pi/agent/subagent.json`.
-- `defaultAgent` can be configured in `.pi/subagent.json`.
-- Project config overrides user config.
-- `pi` starts with the configured default agent active.
-- `pi --agent worker` overrides configured `defaultAgent: "plan"`.
-- Hidden agents can be activated by `defaultAgent` exact name.
-- Invalid or missing default agent warns and continues.
-- Existing `viewerKey` behavior is unchanged.
-- Child subagent execution is not altered by the parent convenience default.
+- When no active agent is selected, current prompt behavior is unchanged.
+- When an active agent is selected, the returned system prompt starts with the active-agent section.
+- The active-agent replacement prompt does not include Pi's default coding-agent persona from `event.systemPrompt`.
+- The active-agent replacement prompt includes selected tool descriptions.
+- The active-agent replacement prompt includes default and configured guidelines.
+- The active-agent replacement prompt includes available subagent instructions when `subagent` is active.
+- The active-agent replacement prompt includes project context files.
+- The active-agent replacement prompt includes skills when `read` is active.
+- The active-agent replacement prompt omits skills when `read` is inactive.
+- The active-agent replacement prompt includes current date and cwd.
+- Existing model/thinking/tool activation behavior is unchanged.
+- Existing `/agent` command behavior is unchanged.
+- Existing `defaultAgent` config behavior is unchanged.
+
+## Test scenarios
+
+### No active agent
+
+Given:
+
+- discovered visible agent `plan`
+- no active agent
+- `event.systemPrompt = "BASE PROMPT"`
+
+Expect:
+
+- returned prompt starts with `BASE PROMPT`
+- returned prompt includes `Available Subagents`
+
+### Active agent override
+
+Given:
+
+- active agent `plan`
+- `event.systemPrompt = "BASE PROMPT SHOULD NOT APPEAR"`
+- `plan.systemPrompt = "You are a planning assistant."`
+
+Expect:
+
+- returned prompt starts with active-agent heading
+- returned prompt includes `You are a planning assistant.`
+- returned prompt does not include `BASE PROMPT SHOULD NOT APPEAR`
+
+### Tools
+
+Given:
+
+```ts
+selectedTools: ["read", "grep", "subagent"]
+toolSnippets: {
+  read: "Read file contents",
+  grep: "Search file contents",
+  write: "Write files",
+  subagent: "Delegate work",
+}
+```
+
+Expect:
+
+- `read`, `grep`, and `subagent` appear
+- `write` does not appear
+
+### Skills
+
+Given skills exist and `read` is active:
+
+- skill list appears
+
+Given skills exist and `read` is inactive:
+
+- skill list is omitted
+
+### Hidden agents
+
+Given visible agent `plan` and hidden agent `oracle`:
+
+- prompt-level subagent list includes `plan`
+- prompt-level subagent list excludes `oracle`
+
+## Manual verification
+
+Run:
+
+```bash
+pi -e . --agent plan
+```
+
+Ask a simple planning request.
+
+Expected behavior:
+
+- model follows the plan agent role first
+- prompt no longer emphasizes Pi's generic coding persona before the plan agent
+- available tools and skills still work normally
+
+Run:
+
+```bash
+pi -e .
+```
+
+without an active/default agent.
+
+Expected behavior:
+
+- prompt behavior remains append-based as before
+- subagent tool instructions still appear
 
 ## Non-goals
 
 This feature should not change:
 
 - agent discovery precedence
+- active-agent config parsing
+- default-agent startup selection
 - hidden-agent visibility rules
-- `/agent` command behavior
-- cycle switching behavior
-- subagent tool invocation shape
-- child subagent markdown config handling
+- active tool application
+- model selection
+- thinking-level selection
+- child subagent process execution
+- subagent invocation schema

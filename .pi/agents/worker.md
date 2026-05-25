@@ -1,6 +1,8 @@
 ---
 name: worker
 description: Execute implementation tasks by reading, writing, and editing code files.
+model: axonhub/gpt-5.4-mini
+thinking: medium
 tools: read,bash,grep,find,ls,edit,write,mcp,ask_user_question,subagent
 ---
 
