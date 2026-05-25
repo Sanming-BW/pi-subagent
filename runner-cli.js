@@ -77,6 +77,7 @@ export function parseInheritedCliArgs(argv) {
         "--append-system-prompt",
         "--export",
         "--subagent-max-depth",
+        "--agent",
       ].includes(flagName)
     ) {
       const [, skip] = getValue();

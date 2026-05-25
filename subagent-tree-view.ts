@@ -50,15 +50,21 @@ class SubagentViewerComponent {
   private detailScroll = 0;
   private readonly root: SubagentTreeNode;
   private readonly flat: FlatSubagentNode[];
+  private readonly theme: Theme;
+  private readonly requestRender: RequestRender;
+  private readonly done: Done;
   private cachedWidth?: number;
   private cachedLines?: string[];
 
   constructor(
     branch: unknown[],
-    private readonly theme: Theme,
-    private readonly requestRender: RequestRender,
-    private readonly done: Done,
+    theme: Theme,
+    requestRender: RequestRender,
+    done: Done,
   ) {
+    this.theme = theme;
+    this.requestRender = requestRender;
+    this.done = done;
     this.root = buildSubagentTree(branch);
     this.flat = flattenSubagentTree(this.root);
     this.selected = this.flat.length > 1 ? 1 : 0;

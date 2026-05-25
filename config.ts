@@ -6,10 +6,13 @@ import type { KeyId } from "@mariozechner/pi-tui";
 
 export interface SubagentExtensionConfig {
   viewerKey: KeyId | "none";
+  cycleAgentKey: KeyId | "none";
+  defaultAgent?: string;
 }
 
 export const DEFAULT_SUBAGENT_CONFIG: SubagentExtensionConfig = {
   viewerKey: "ctrl+k",
+  cycleAgentKey: "ctrl+h",
 };
 
 const VALID_KEY_RE = /^(none|(?:ctrl|shift|alt|super)(?:\+(?:ctrl|shift|alt|super))*\+[a-z0-9]|[a-z0-9]|enter|return|escape|tab|space|backspace|delete|home|end|up|down|left|right|pageup|pagedown)$/i;
@@ -18,28 +21,53 @@ function warn(message: string): void {
   console.warn(`[pi-subagent] ${message}`);
 }
 
+type ConfigKeyName = "viewerKey" | "cycleAgentKey";
+
+function normalizeKey(
+  raw: unknown,
+  source: string,
+  keyName: ConfigKeyName,
+): KeyId | "none" | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") {
+    warn(`Ignoring ${source} ${keyName}: expected a string.`);
+    return undefined;
+  }
+
+  const key = raw.trim().toLowerCase();
+  if (!VALID_KEY_RE.test(key)) {
+    warn(`Ignoring ${source} ${keyName}="${raw}": invalid key format.`);
+    return undefined;
+  }
+
+  return key === "pageup"
+    ? "pageUp"
+    : key === "pagedown"
+      ? "pageDown"
+      : key as KeyId | "none";
+}
+
 function normalizeConfig(raw: unknown, source: string): Partial<SubagentExtensionConfig> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     warn(`Ignoring ${source}: expected a JSON object.`);
     return {};
   }
 
-  const input = raw as { viewerKey?: unknown };
+  const input = raw as { viewerKey?: unknown; cycleAgentKey?: unknown; defaultAgent?: unknown };
   const result: Partial<SubagentExtensionConfig> = {};
-  if (input.viewerKey !== undefined) {
-    if (typeof input.viewerKey !== "string") {
-      warn(`Ignoring ${source} viewerKey: expected a string.`);
+
+  const viewerKey = normalizeKey(input.viewerKey, source, "viewerKey");
+  if (viewerKey !== undefined) result.viewerKey = viewerKey;
+
+  const cycleAgentKey = normalizeKey(input.cycleAgentKey, source, "cycleAgentKey");
+  if (cycleAgentKey !== undefined) result.cycleAgentKey = cycleAgentKey;
+
+  if (input.defaultAgent !== undefined) {
+    if (typeof input.defaultAgent !== "string") {
+      warn(`Ignoring ${source} defaultAgent: expected a string.`);
     } else {
-      const key = input.viewerKey.trim().toLowerCase();
-      if (!VALID_KEY_RE.test(key)) {
-        warn(`Ignoring ${source} viewerKey="${input.viewerKey}": invalid key format.`);
-      } else {
-        result.viewerKey = key === "pageup"
-          ? "pageUp"
-          : key === "pagedown"
-            ? "pageDown"
-            : key as KeyId | "none";
-      }
+      const defaultAgent = input.defaultAgent.trim();
+      if (defaultAgent) result.defaultAgent = defaultAgent;
     }
   }
   return result;
@@ -79,4 +107,17 @@ export function loadSubagentConfig(cwd: string): SubagentExtensionConfig {
     ...userConfig,
     ...projectConfig,
   };
+}
+
+export function resolveStartupAgentName(
+  cliAgent: unknown,
+  config: SubagentExtensionConfig,
+  isRootSession: boolean,
+): string | undefined {
+  if (typeof cliAgent === "string") {
+    const trimmed = cliAgent.trim();
+    if (trimmed) return trimmed;
+  }
+  if (isRootSession) return config.defaultAgent?.trim() || undefined;
+  return undefined;
 }

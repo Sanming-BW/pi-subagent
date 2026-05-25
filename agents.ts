@@ -24,6 +24,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	thinking?: string;
+	hidden?: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -60,6 +61,15 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 }
 
 /** Parse a single agent markdown file into an AgentConfig. Returns null on skip. */
+function parseTruthiness(value: unknown): boolean | undefined {
+	if (typeof value === "boolean") return value;
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return undefined;
+}
+
 function parseAgentFile(
 	filePath: string,
 	source: "user" | "project",
@@ -99,6 +109,7 @@ function parseAgentFile(
 		tools,
 		model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 		thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
+		hidden: parseTruthiness(frontmatter.hidden),
 		systemPrompt: body,
 		source,
 		filePath,
@@ -134,6 +145,10 @@ function mergeAgents(...groups: AgentConfig[][]): AgentConfig[] {
 		for (const agent of group) agentMap.set(agent.name, agent);
 	}
 	return Array.from(agentMap.values());
+}
+
+export function getVisibleAgents(agents: AgentConfig[]): AgentConfig[] {
+	return agents.filter((agent) => !agent.hidden);
 }
 
 // ---------------------------------------------------------------------------

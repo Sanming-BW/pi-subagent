@@ -31,7 +31,8 @@
     ]
   },
   "scripts": {
-    "test": "node --test"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --test"
   },
   "keywords": [
     "pi",

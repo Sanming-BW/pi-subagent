@@ -14,10 +14,13 @@
  *   - continue: resume a single-mode lineId checkpoint.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@mariozechner/pi-ai";
+import { matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { type AgentConfig, discoverAgents } from "./agents.js";
-import { loadSubagentConfig } from "./config.js";
+import { type AgentConfig, discoverAgents, getVisibleAgents } from "./agents.js";
+import { loadSubagentConfig, resolveStartupAgentName } from "./config.js";
 import { buildForkSessionSnapshotJsonl, type SessionSnapshotSource } from "./fork-snapshot.js";
 import { findVisibleLine, formatAvailableLines } from "./line-history.js";
 import { renderCall, renderResult } from "./render.js";
@@ -27,7 +30,6 @@ import { getResultSummaryText } from "./runner-events.js";
 import { withLineLock } from "./line-lock.js";
 import { mapConcurrent, runAgent } from "./runner.js";
 import { getWorktreeFingerprint, hasWorktreeDrift, WORKTREE_DRIFT_TASK_PREFIX } from "./worktree-fingerprint.js";
-import { matchesKey } from "@mariozechner/pi-tui";
 import {
   type DelegationMode,
   type SingleResult,
@@ -317,6 +319,131 @@ function formatAgentNames(agents: AgentConfig[]): string {
   return agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 }
 
+function formatVisibleAgentNames(agents: AgentConfig[]): string {
+  const visible = getVisibleAgents(agents);
+  return visible.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+}
+
+function resolveAgentByExactName(agents: AgentConfig[], name: string): AgentConfig | undefined {
+  const trimmed = name.trim();
+  if (!trimmed) return undefined;
+  return agents.find((agent) => agent.name === trimmed);
+}
+
+function resolveModelReference(ctx: ExtensionContext, reference: string): Model<any> | undefined {
+  const trimmed = reference.trim();
+  if (!trimmed) return undefined;
+
+  const allModels = ctx.modelRegistry.getAll();
+  if (trimmed.includes("/")) {
+    const slashIdx = trimmed.indexOf("/");
+    const provider = trimmed.slice(0, slashIdx).trim();
+    const modelId = trimmed.slice(slashIdx + 1).trim();
+    if (provider && modelId) {
+      const resolved = ctx.modelRegistry.find(provider, modelId);
+      if (resolved) return resolved;
+    }
+  }
+
+  const canonicalMatches = allModels.filter((model) => `${model.provider}/${model.id}` === trimmed);
+  if (canonicalMatches.length === 1) return canonicalMatches[0];
+
+  const exactIdMatches = allModels.filter((model) => model.id === trimmed);
+  if (exactIdMatches.length === 1) return exactIdMatches[0];
+  if (exactIdMatches.length > 1) {
+    console.warn(
+      `[pi-subagent] Agent model reference "${reference}" is ambiguous across providers. Use provider/model-id form instead.`,
+    );
+  }
+
+  return undefined;
+}
+
+interface ActiveAgentRuntimeState {
+  baseline?: {
+    model: Model<any> | undefined;
+    thinkingLevel: ThinkingLevel;
+    tools: string[];
+  };
+  activeAgentName?: string;
+  activeAgent?: AgentConfig;
+}
+
+function updateActiveAgentStatus(ctx: ExtensionContext, activeAgent?: AgentConfig): void {
+  const statusText = activeAgent ? ctx.ui.theme.fg("accent", `agent:${activeAgent.name}`) : undefined;
+  ctx.ui.setStatus("active-agent", statusText);
+  ctx.ui.setWidget(
+    "active-agent",
+    activeAgent ? [ctx.ui.theme.fg("accent", `Active agent: ${activeAgent.name}`)] : undefined,
+  );
+}
+
+async function restoreBaselineAgentState(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: ActiveAgentRuntimeState,
+): Promise<void> {
+  if (!state.baseline) return;
+  const { model, thinkingLevel, tools } = state.baseline;
+  if (model) {
+    await pi.setModel(model);
+  }
+  pi.setThinkingLevel(thinkingLevel);
+  pi.setActiveTools(tools);
+}
+
+async function applyActiveAgent(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: ActiveAgentRuntimeState,
+  agent: AgentConfig,
+): Promise<void> {
+  if (!state.baseline) {
+    state.baseline = {
+      model: ctx.model,
+      thinkingLevel: pi.getThinkingLevel(),
+      tools: pi.getActiveTools(),
+    };
+  }
+
+  await restoreBaselineAgentState(pi, ctx, state);
+
+  if (agent.model) {
+    const model = resolveModelReference(ctx, agent.model);
+    if (model) {
+      const success = await pi.setModel(model);
+      if (!success) {
+        ctx.ui.notify(`Agent "${agent.name}": No API key for ${agent.model}`, "warning");
+      }
+    } else {
+      ctx.ui.notify(`Agent "${agent.name}": Model ${agent.model} not found`, "warning");
+    }
+  }
+
+  if (agent.thinking) {
+    pi.setThinkingLevel(agent.thinking as ReturnType<ExtensionAPI["getThinkingLevel"]>);
+  }
+
+  if (agent.tools !== undefined) {
+    pi.setActiveTools(agent.tools);
+  }
+
+  state.activeAgentName = agent.name;
+  state.activeAgent = agent;
+  updateActiveAgentStatus(ctx, agent);
+}
+
+async function clearActiveAgent(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: ActiveAgentRuntimeState,
+): Promise<void> {
+  await restoreBaselineAgentState(pi, ctx, state);
+  state.activeAgentName = undefined;
+  state.activeAgent = undefined;
+  updateActiveAgentStatus(ctx, undefined);
+}
+
 function getAllToolNames(pi: ExtensionAPI): string[] {
   const getAllTools = (pi as ExtensionAPI & { getAllTools?: () => Array<{ name: string }> }).getAllTools;
   if (typeof getAllTools !== "function") return [];
@@ -357,6 +484,10 @@ export default function (pi: ExtensionAPI) {
     description: "Maximum allowed subagent delegation depth (default: 3).",
     type: "string",
   });
+  pi.registerFlag("agent", {
+    description: "Active agent to apply at startup.",
+    type: "string",
+  });
   pi.registerFlag("subagent-prevent-cycles", {
     description:
       "Block delegating to agents already in the current delegation stack (default: true).",
@@ -368,6 +499,73 @@ export default function (pi: ExtensionAPI) {
     depthConfig;
 
   let discoveredAgents: AgentConfig[] = [];
+  const activeAgentState: ActiveAgentRuntimeState = {};
+
+  function getVisibleDiscoveredAgents(): AgentConfig[] {
+    return getVisibleAgents(discoveredAgents);
+  }
+
+  function getVisibleAgentNames(): string[] {
+    return getVisibleDiscoveredAgents().map((agent) => agent.name);
+  }
+
+  function getNextAgentInCycle(): AgentConfig | undefined {
+    const visible = getVisibleDiscoveredAgents();
+    if (visible.length === 0) return undefined;
+    if (!activeAgentState.activeAgentName) return visible[0];
+
+    const currentIndex = visible.findIndex((agent) => agent.name === activeAgentState.activeAgentName);
+    if (currentIndex === -1) return visible[0];
+    if (currentIndex >= visible.length - 1) return undefined;
+    return visible[currentIndex + 1];
+  }
+
+  async function cycleActiveAgent(ctx: ExtensionContext): Promise<void> {
+    const next = getNextAgentInCycle();
+    if (!next) {
+      await clearActiveAgent(pi, ctx, activeAgentState);
+      ctx.ui.notify("Active agent cleared.", "info");
+      return;
+    }
+
+    await applyActiveAgent(pi, ctx, activeAgentState, next);
+    ctx.ui.notify(`Active agent: ${next.name}`, "info");
+  }
+
+  async function setActiveAgentByName(name: string, ctx: ExtensionContext): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === "none" || trimmed === "clear") {
+      await clearActiveAgent(pi, ctx, activeAgentState);
+      ctx.ui.notify("Active agent cleared.", "info");
+      return;
+    }
+
+    const agent = resolveAgentByExactName(discoveredAgents, trimmed);
+    if (!agent) {
+      ctx.ui.notify(`Unknown agent: ${trimmed}`, "warning");
+      return;
+    }
+
+    await applyActiveAgent(pi, ctx, activeAgentState, agent);
+    ctx.ui.notify(`Active agent: ${agent.name}`, "info");
+  }
+
+  async function openAgentSelector(ctx: ExtensionContext): Promise<void> {
+    const visible = getVisibleDiscoveredAgents();
+    const choices = ["(none)", ...visible.map((agent) => agent.name)];
+    const selected = await ctx.ui.select("Select active agent", choices);
+    if (!selected) return;
+    if (selected === "(none)") {
+      await clearActiveAgent(pi, ctx, activeAgentState);
+      ctx.ui.notify("Active agent cleared.", "info");
+      return;
+    }
+    const agent = resolveAgentByExactName(discoveredAgents, selected);
+    if (agent) {
+      await applyActiveAgent(pi, ctx, activeAgentState, agent);
+      ctx.ui.notify(`Active agent: ${agent.name}`, "info");
+    }
+  }
 
   pi.registerCommand("subagents", {
     description: "Open subagent viewer",
@@ -376,10 +574,38 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("agent", {
+    description: "Set the active agent for future turns",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const items = getVisibleAgentNames()
+        .filter((name) => name.toLowerCase().startsWith(normalized))
+        .map((name) => ({ value: name, label: name }));
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+      if (!trimmed) {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Agent selector requires UI mode.", "warning");
+          return;
+        }
+        await openAgentSelector(ctx);
+        return;
+      }
+      await setActiveAgentByName(trimmed, ctx);
+    },
+  });
+
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    activeAgentState.baseline = undefined;
+    activeAgentState.activeAgentName = undefined;
+    activeAgentState.activeAgent = undefined;
+    updateActiveAgentStatus(ctx, undefined);
+
+    const config = loadSubagentConfig(ctx.cwd);
     if (ctx.hasUI) {
-      const config = loadSubagentConfig(ctx.cwd);
       const ui = ctx.ui as typeof ctx.ui & {
         onTerminalInput?: (handler: (data: string) => { consume: boolean } | undefined) => void;
       };
@@ -392,6 +618,15 @@ export default function (pi: ExtensionAPI) {
           return { consume: true };
         });
       }
+      if (config.cycleAgentKey !== "none" && typeof ui.onTerminalInput === "function") {
+        const cycleAgentKey = config.cycleAgentKey;
+        ui.onTerminalInput((data: string) => {
+          if (viewerOpen) return undefined;
+          if (!matchesKey(data, cycleAgentKey)) return undefined;
+          void cycleActiveAgent(ctx);
+          return { consume: true };
+        });
+      }
     }
 
     if (!canDelegate) return;
@@ -399,12 +634,36 @@ export default function (pi: ExtensionAPI) {
     const discovery = discoverAgents(ctx.cwd, "both", getAllToolNames(pi));
     discoveredAgents = discovery.agents;
 
-    if (discoveredAgents.length > 0 && ctx.hasUI) {
-      const list = discoveredAgents
+    const cliAgent = pi.getFlag("agent");
+    const hasCliAgent = typeof cliAgent === "string" && cliAgent.trim().length > 0;
+    const requestedAgent = resolveStartupAgentName(
+      cliAgent,
+      config,
+      currentDepth === 0,
+    );
+    if (requestedAgent) {
+      const requested = resolveAgentByExactName(discoveredAgents, requestedAgent);
+      if (requested) {
+        await applyActiveAgent(pi, ctx, activeAgentState, requested);
+      } else {
+        const warning = !hasCliAgent
+          ? `Unknown default agent: ${requestedAgent}`
+          : `Unknown agent: ${requestedAgent}`;
+        if (ctx.hasUI) {
+          ctx.ui.notify(warning, "warning");
+        } else {
+          console.warn(`[pi-subagent] ${warning}`);
+        }
+      }
+    }
+
+    const visibleAgents = getVisibleDiscoveredAgents();
+    if (visibleAgents.length > 0 && ctx.hasUI) {
+      const list = visibleAgents
         .map((a) => `  - ${a.name} (${a.source})`)
         .join("\n");
       ctx.ui.notify(
-        `Found ${discoveredAgents.length} subagent(s):\n${list}`,
+        `Found ${visibleAgents.length} subagent(s):\n${list}`,
         "info",
       );
     }
@@ -413,15 +672,15 @@ export default function (pi: ExtensionAPI) {
   // Inject available agents into the system prompt
   pi.on("before_agent_start", async (event) => {
     if (!canDelegate) return;
-    if (discoveredAgents.length === 0) return;
+    const visibleAgents = getVisibleDiscoveredAgents();
+    if (visibleAgents.length === 0 && !activeAgentState.activeAgent) return;
 
-    const agentList = discoveredAgents
-      .map((a) => `- **${a.name}**: ${a.description}`)
-      .join("\n");
-    return {
-      systemPrompt:
-        event.systemPrompt +
-        `\n\n## Available Subagents
+    const sections: string[] = [];
+    if (visibleAgents.length > 0) {
+      const agentList = visibleAgents
+        .map((a) => `- **${a.name}**: ${a.description}`)
+        .join("\n");
+      sections.push(`## Available Subagents
 
 The following subagents are available via the \`subagent\` tool:
 
@@ -458,8 +717,17 @@ Use single mode for one task, parallel mode when tasks are independent. lineId i
 
 - Max depth: current depth ${currentDepth}, max depth ${maxDepth}
 - Cycle prevention: ${preventCycles ? "enabled" : "disabled"}
-- Current delegation stack: ${ancestorAgentStack.length > 0 ? ancestorAgentStack.join(" -> ") : "(root)"}
-`,
+- Current delegation stack: ${ancestorAgentStack.length > 0 ? ancestorAgentStack.join(" -> ") : "(root)"}`);
+    }
+
+    if (activeAgentState.activeAgent) {
+      sections.push(`## Active Agent: ${activeAgentState.activeAgent.name}
+
+${activeAgentState.activeAgent.systemPrompt}`);
+    }
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${sections.join("\n\n")}`,
     };
   });
 

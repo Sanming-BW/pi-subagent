@@ -1,134 +1,88 @@
+# README
+
 A fork from [mjakl/pi-subagent](https://github.com/mjakl/pi-subagent).
 
 If you come here, you probably have lost your way.
+
+## Active agent mode
+
+This extension now supports a main-session **active agent** that changes the model, thinking level, tools, and system prompt for future turns only.
+
+### Start with an agent
+
+```bash
+pi -e . --agent plan
+```
+
+If the agent exists, it becomes active at startup. Hidden agents can also be selected this way.
+
+### Set a default active agent
+
+You can configure a default agent once and have Pi start with it automatically.
+
+User config:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+Project config:
+
+```text
+.pi/subagent.json
+```
+
+Project config overrides user config. CLI `--agent <name>` always wins over config.
+
+Example:
+
+```json
+{
+  "viewerKey": "ctrl+shift+o",
+  "cycleAgentKey": "alt+shift+f",
+  "defaultAgent": "plan"
+}
+```
+
+`defaultAgent` is matched by exact agent name, so hidden agents can also be selected this way.
+
+If the configured agent does not exist, Pi shows a warning and continues without an active agent.
+
+### Switch agents in the TUI
+
+- `/agent` opens a selector with visible agents only
+- `/agent <name>` switches by exact name, including hidden agents
+- `/agent none` or `/agent clear` clears the active agent
+- `Alt+Shift+F` cycles through visible agents and then back to none by default
+
+Configure the cycle shortcut with `cycleAgentKey` in the same user or project config files. It uses the same key format as `viewerKey`; set it to `"none"` to disable only the shortcut while keeping `/agent` available.
+
+### Hidden agents
+
+Add `hidden: true` in an agent frontmatter to hide it from discovery-oriented UI:
+
+```yaml
+---
+name: oracle
+hidden: true
+---
+```
+
+Hidden agents are excluded from:
+
+- `/agent` selector
+- `/agent` completions
+- startup discovery notifications
+- system-prompt agent lists
+- cycle order
+
+They still work when addressed exactly, for example `/agent oracle` or `subagent({ agent: "oracle", ... })`.
 
 ## session continue
 
 `subagent` supports three context modes:
 
 - `spawn`: start a child with only the task prompt. Without `lineId`, this remains one-shot.
-- `fork`: start a child from the current parent session snapshot. Without `lineId`, this remains one-shot.
-- `continue`: resume an explicitly named subagent line.
+- `fork`: start a child from the current session state.
+- `continue`: resume a previously created line checkpoint.
 
-Create a reusable line by passing `lineId` to `spawn` or `fork`:
-
-```json
-{ "agent": "writer", "mode": "fork", "lineId": "readme", "task": "Start improving README." }
-```
-
-Continue it later with the same agent and line id:
-
-```json
-{ "agent": "writer", "mode": "continue", "lineId": "readme", "task": "Continue from the last checkpoint." }
-```
-
-Rules:
-
-- `continue` must include `lineId`; no default line is selected.
-- Only single mode supports `continue` for now.
-- Each agent has its own current-branch recent line list.
-- Only the latest 3 visible lines per agent in the current parent branch can be continued.
-- Parent session tree rollback changes line visibility: lines created after the rollback point are not visible.
-- If the worktree changed since the line checkpoint, the child task is prefixed with a warning to re-read relevant files before editing.
-- Same `parentSessionId + agent + lineId` calls are locked; concurrent open/continue on the same line fails instead of queueing.
-- Copy-on-write continue for child sessions advanced by sibling branches is planned but not implemented yet.
-
-## Subagent viewer
-
-Use `/subagents` to open an overlay viewer for subagent runs recorded in the current session branch. The viewer starts in tree mode, where single subagent calls appear as agent nodes, normal parallel calls appear as a parent node with one child per agent, and zero-result parallel calls appear as `blocked` rows with their recorded reason available in detail view.
-
-Tree keys:
-
-- `↑` / `↓`: select previous or next visible node
-- `←`: select parent node
-- `→`: select first child node
-- `Home` / `End`: jump to first or last visible node
-- `Enter`: open the selected subagent or parallel-call detail
-- `Esc` or `q`: close the viewer
-
-Detail keys:
-
-- `↑` / `↓`: scroll detail output
-- `PageUp` / `PageDown`: scroll by page
-- `Home` / `End`: jump to top or bottom
-- `Esc`: return to the tree
-- `q`: close the viewer
-
-The default shortcut is `ctrl+shift+m`. Configure it with either a user config file:
-
-```text
-~/.pi/agent/subagent.json
-```
-
-or a project config file:
-
-```text
-.pi/subagent.json
-```
-
-Project config overrides user config. Example:
-
-```json
-{
-  "viewerKey": "ctrl+shift+o"
-}
-```
-
-Disable only the shortcut while keeping `/subagents` available:
-
-```json
-{
-  "viewerKey": "none"
-}
-```
-
-Config changes require `/reload` or restarting Pi.
-
-## tools 语法
-
-`tools` 字段支持一种简单的选择表达式，用来控制子 agent 可用的工具。
-
-### 支持的写法
-
-```yaml
-tools: "*"
-```
-
-表示启用当前运行时可用的全部工具。
-
-```yaml
-tools: "*, -bash"
-```
-
-表示启用全部工具，但排除 `bash`。
-
-```yaml
-tools: "*, -bash, -write, -edit"
-```
-
-表示启用全部工具，但排除多个工具。
-
-```yaml
-tools: "*, -[bash, write, edit]"
-```
-
-表示启用全部工具，但排除一个列表。
-
-```yaml
-tools: "read, bash"
-```
-
-表示只启用指定工具。
-
-### 说明
-
-- `*` 表示当前运行时全部可用工具
-- `-工具名` 表示排除某个工具
-- `-[工具1, 工具2, 工具3]` 表示批量排除
-- 如果只写负项，例如 `-bash`，会按 `*, -bash` 处理
-- YAML 里建议给 `*` 加引号，例如 `"*"`、`"*, -bash"`
-- 禁止递归委托可排除 subagent 工具，例如 `tools: "*, -subagent"`
-
-## License
-
-MIT
