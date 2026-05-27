@@ -1,4 +1,7 @@
 /.tickets/
 /test
 TODO.md
+*REFERENCE*.md
+/for_agent
 /.pi/rewind
+.tmp-pi-subagent-view-data-*/

@@ -114,7 +114,7 @@ test("stderr remains a fallback only for error results", () => {
 test("tool_execution_end with toolName=subagent appends nestedDetails and dedupes by toolCallId", () => {
   const result = makeResult();
   const details = {
-    mode: "parallel",
+    mode: "single",
     delegationMode: "spawn",
     projectAgentsDir: null,
     results: [
@@ -122,23 +122,6 @@ test("tool_execution_end with toolName=subagent appends nestedDetails and dedupe
         agent: "worker-a",
         agentSource: "user",
         task: "do a",
-        exitCode: 0,
-        messages: [],
-        stderr: "",
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          cost: 0,
-          contextTokens: 0,
-          turns: 0,
-        },
-      },
-      {
-        agent: "worker-b",
-        agentSource: "user",
-        task: "do b",
         exitCode: 0,
         messages: [],
         stderr: "",
@@ -164,7 +147,7 @@ test("tool_execution_end with toolName=subagent appends nestedDetails and dedupe
 
   assert.equal(processPiEvent(event, result), true);
   assert.equal(result.nestedDetails?.length, 1);
-  assert.equal(result.nestedDetails[0].results.length, 2);
+  assert.equal(result.nestedDetails[0].results.length, 1);
 
   // Same toolCallId again: must not duplicate.
   assert.equal(processPiEvent(event, result), false);

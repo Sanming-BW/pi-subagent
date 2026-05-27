@@ -12,6 +12,7 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { AgentConfig } from "./agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
+import { getSessionLeafId } from "./session-checkpoint.js";
 import {
   type DelegationMode,
   type SingleResult,
@@ -84,7 +85,7 @@ function cleanupTempDir(dir: string | null): void {
   }
 }
 
-function findSessionFileById(sessionId: string, startDir: string): string | undefined {
+function findSessionFileById(sessionId: string): string | undefined {
   const candidates = [process.env.PI_CODING_AGENT_SESSION_DIR, path.join(os.homedir(), ".pi", "agent", "sessions")]
     .filter((value): value is string => Boolean(value));
 
@@ -115,27 +116,13 @@ function findSessionFileById(sessionId: string, startDir: string): string | unde
     }
   }
 
-  void startDir;
   return undefined;
-}
-
-function getSessionLeafId(sessionFile: string): string | undefined {
-  try {
-    const entries = fs.readFileSync(sessionFile, "utf8").trim().split(/\r?\n/)
-      .map((line) => JSON.parse(line))
-      .filter((entry) => entry?.type !== "session" && typeof entry?.id === "string");
-    if (entries.length === 0) return undefined;
-    const parentIds = new Set(entries.map((entry) => entry.parentId).filter((id) => typeof id === "string"));
-    return entries.findLast((entry) => !parentIds.has(entry.id))?.id ?? entries.at(-1)?.id;
-  } catch {
-    return undefined;
-  }
 }
 
 function finalizeChildCheckpoint(result: SingleResult): void {
   if (!result.childSessionId) return;
   if (!result.childSessionFile) {
-    result.childSessionFile = findSessionFileById(result.childSessionId, process.cwd());
+    result.childSessionFile = findSessionFileById(result.childSessionId);
   }
   if (!result.childLeafId && result.childSessionFile) {
     result.childLeafId = getSessionLeafId(result.childSessionFile);
@@ -527,31 +514,3 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency helper
-// ---------------------------------------------------------------------------
-
-/**
- * Map over items with a bounded number of concurrent workers.
- */
-export async function mapConcurrent<TIn, TOut>(
-  items: TIn[],
-  concurrency: number,
-  fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-  if (items.length === 0) return [];
-  const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
-  let nextIndex = 0;
-
-  const worker = async () => {
-    while (true) {
-      const i = nextIndex++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
-    }
-  };
-
-  await Promise.all(Array.from({ length: limit }, () => worker()));
-  return results;
-}

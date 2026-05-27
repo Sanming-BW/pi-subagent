@@ -4,9 +4,8 @@
  * Delegates tasks to specialized subagents, each running as an isolated `pi`
  * process.
  *
- * Supports two invocation shapes:
- *   - Single:   { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
+ * Supports a single invocation shape:
+ *   - Single: { agent: "name", task: "..." }
  *
  * Context modes:
  *   - spawn (default): child gets only the task prompt.
@@ -29,29 +28,25 @@ import { loadSubagentConfig, resolveStartupAgentName } from "./config.js";
 import { buildForkSessionSnapshotJsonl, type SessionSnapshotSource } from "./fork-snapshot.js";
 import { findVisibleLine, formatAvailableLines } from "./line-history.js";
 import { renderCall, renderResult } from "./render.js";
-import { openSubagentViewer } from "./subagent-tree-view.js";
+import { openSubagentViewer, type SubagentViewerContext } from "./subagent-tree-view.js";
+import { createActivityStore, type ActivityStore } from "./subagent-view-data.js";
 import { materializeCheckpointSnapshot, needsCopyOnWrite } from "./session-checkpoint.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { withLineLock } from "./line-lock.js";
-import { mapConcurrent, runAgent } from "./runner.js";
+import { runAgent } from "./runner.js";
 import { getWorktreeFingerprint, hasWorktreeDrift, WORKTREE_DRIFT_TASK_PREFIX } from "./worktree-fingerprint.js";
 import {
   type DelegationMode,
   type SingleResult,
   type SubagentDetails,
   DEFAULT_DELEGATION_MODE,
-  emptyUsage,
   isResultError,
-  isResultSuccess,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
-const PARALLEL_HEARTBEAT_MS = 1000;
 const DEFAULT_MAX_DELEGATION_DEPTH = 3;
 const DEFAULT_PREVENT_CYCLE_DELEGATION = true;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -62,19 +57,6 @@ const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 // ---------------------------------------------------------------------------
 // Tool parameter schema
 // ---------------------------------------------------------------------------
-
-const TaskItem = Type.Object({
-  agent: Type.String({
-    description: "Name of an available agent (must match exactly)",
-  }),
-  task: Type.String({
-    description:
-      "Task description for this delegated run. In spawn mode include all required context; in fork mode the subagent also sees your current session context.",
-  }),
-  cwd: Type.Optional(
-    Type.String({ description: "Working directory for this agent's process" }),
-  ),
-});
 
 const SubagentParams = Type.Object({
   agent: Type.Optional(
@@ -87,12 +69,6 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Task description for single mode. In spawn mode it must be self-contained; in fork mode the subagent also receives your current session context.",
-    }),
-  ),
-  tasks: Type.Optional(
-    Type.Array(TaskItem, {
-      description:
-        "For parallel mode: array of {agent, task} objects. Each task runs in an isolated process concurrently. Do NOT set agent/task when using this.",
     }),
   ),
   mode: Type.Optional(
@@ -311,13 +287,12 @@ function makeDetailsFactory(
   projectAgentsDir: string | null,
   delegationMode: DelegationMode,
 ) {
-  return (mode: "single" | "parallel") =>
-    (results: SingleResult[]): SubagentDetails => ({
-      mode,
-      delegationMode,
-      projectAgentsDir,
-      results,
-    });
+  return (results: SingleResult[]): SubagentDetails => ({
+    mode: "single",
+    delegationMode,
+    projectAgentsDir,
+    results,
+  });
 }
 
 function formatAgentNames(agents: AgentConfig[]): string {
@@ -500,6 +475,8 @@ Context behavior is controlled by optional 'mode':
 - 'fork': child receives a forked snapshot of current session context plus the task prompt.
 - 'continue': resume a previous single-mode checkpoint by agent + lineId.
 
+Call subagent once per delegated task.
+
 **Single mode** — delegate one task:
 \`\`\`json
 { "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
@@ -510,13 +487,6 @@ Context behavior is controlled by optional 'mode':
 { "agent": "agent-name", "mode": "spawn", "lineId": "short-stable-name", "task": "Start work..." }
 { "agent": "agent-name", "mode": "continue", "lineId": "short-stable-name", "task": "Continue work..." }
 \`\`\`
-
-**Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task):
-\`\`\`json
-{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
-\`\`\`
-
-Use single mode for one task, parallel mode when tasks are independent. lineId is caller-chosen, not generated automatically, and top-level lineId is single-mode only.
 
 ### Runtime delegation guards
 
@@ -683,13 +653,102 @@ function buildActiveAgentSystemPrompt(input: {
 
 export default function (pi: ExtensionAPI) {
   let viewerOpen = false;
+  const activityStore: ActivityStore = createActivityStore();
 
-  async function guardedOpenSubagentViewer(ctx: { hasUI?: boolean; ui?: { notify?: (message: string, level?: string) => void }; sessionManager: SessionSnapshotSource; cwd: string }): Promise<void> {
+  function getSessionIdFromHeader(header: unknown): string | null {
+    if (!header || typeof header !== "object") return null;
+    const maybe = header as { id?: unknown };
+    return typeof maybe.id === "string" && maybe.id.trim() ? maybe.id : null;
+  }
+
+  function getMessageRole(value: unknown): string | null {
+    if (!value || typeof value !== "object") return null;
+    const maybe = value as { role?: unknown };
+    return typeof maybe.role === "string" ? maybe.role : null;
+  }
+
+  function getMessageText(value: unknown): string | null {
+    if (!value || typeof value !== "object") return null;
+    const maybe = value as { content?: unknown };
+    if (typeof maybe.content === "string") return maybe.content;
+    if (!Array.isArray(maybe.content)) return null;
+    const parts: string[] = [];
+    for (const part of maybe.content) {
+      if (part && typeof part === "object") {
+        const item = part as { type?: unknown; text?: unknown };
+        if (item.type === "text" && typeof item.text === "string" && item.text.trim()) {
+          parts.push(item.text);
+        }
+      }
+    }
+    return parts.length > 0 ? parts.join("\n") : null;
+  }
+
+  function syncStoreFromBranch(ctx: ExtensionContext): void {
+    try {
+      const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> | undefined;
+      if (!manager || typeof manager.getBranch !== "function") return;
+      const branch = manager.getBranch();
+      const header = typeof manager.getHeader === "function" ? manager.getHeader() : undefined;
+      activityStore.reconcileBranch(Array.isArray(branch) ? branch : [], header);
+    } catch {
+      /* ignore live-store reconciliation errors */
+    }
+  }
+
+  function handleAgentTurnStart(event: unknown): void {
+    const turnIndex = event && typeof event === "object" && typeof (event as { turnIndex?: unknown }).turnIndex === "number"
+      ? (event as { turnIndex: number }).turnIndex
+      : undefined;
+    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true });
+  }
+
+  function handleAssistantMessage(event: unknown): void {
+    const message = event && typeof event === "object" ? (event as { message?: unknown }).message : undefined;
+    const role = getMessageRole(message);
+    if (role === "assistant") {
+      const text = getMessageText(message);
+      activityStore.updateActiveAgentTurn({
+        status: "streaming",
+        streamingText: text ?? undefined,
+        finalText: text ?? undefined,
+      });
+    }
+  }
+
+  function handleToolExecution(event: unknown, phase: "start" | "update" | "end"): void {
+    if (!event || typeof event !== "object") return;
+    const toolName = typeof (event as { toolName?: unknown }).toolName === "string" ? (event as { toolName: string }).toolName : undefined;
+    const toolCallId = typeof (event as { toolCallId?: unknown }).toolCallId === "string" ? (event as { toolCallId: string }).toolCallId : undefined;
+    if (toolName !== "subagent") return;
+
+    const args = phase === "start" || phase === "update"
+      ? (event as { args?: unknown }).args
+      : undefined;
+    const isError = typeof (event as { isError?: unknown }).isError === "boolean"
+      ? (event as { isError: boolean }).isError
+      : false;
+    const result = phase === "end"
+      ? (event as { result?: unknown }).result
+      : phase === "update"
+        ? (event as { partialResult?: unknown }).partialResult
+        : undefined;
+
+    if (phase === "start") {
+      activityStore.startSubagentTool({ toolCallId, toolName, args, status: "running" });
+    } else if (phase === "update") {
+      activityStore.updateSubagentTool({ toolCallId, toolName, args, result, status: "streaming" });
+    } else {
+      activityStore.endSubagentTool({ toolCallId, toolName, args, result, isError, status: isError ? "error" : "success" });
+    }
+  }
+
+  async function guardedOpenSubagentViewer(ctx: SubagentViewerContext): Promise<void> {
     if (!ctx.hasUI) return;
     if (viewerOpen) return;
     viewerOpen = true;
     try {
-      await openSubagentViewer(ctx as any);
+      await openSubagentViewer({ ...ctx, activityStore });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui?.notify?.(`Subagent viewer failed: ${message}`, "error");
@@ -788,7 +847,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("subagents", {
     description: "Open subagent viewer",
     handler: async (_args, ctx) => {
-      await guardedOpenSubagentViewer(ctx as any);
+      await guardedOpenSubagentViewer(ctx);
     },
   });
 
@@ -821,6 +880,9 @@ export default function (pi: ExtensionAPI) {
     activeAgentState.activeAgentName = undefined;
     activeAgentState.activeAgent = undefined;
     updateActiveAgentStatus(ctx, undefined);
+    const header = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> | undefined)?.getHeader?.();
+    activityStore.reset(getSessionIdFromHeader(header));
+    syncStoreFromBranch(ctx);
 
     const config = loadSubagentConfig(ctx.cwd);
     if (ctx.hasUI) {
@@ -832,7 +894,7 @@ export default function (pi: ExtensionAPI) {
         ui.onTerminalInput((data: string) => {
           if (viewerOpen) return undefined;
           if (!matchesKey(data, viewerKey)) return undefined;
-          void guardedOpenSubagentViewer(ctx as any);
+          void guardedOpenSubagentViewer(ctx);
           return { consume: true };
         });
       }
@@ -887,6 +949,89 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("agent_start", async (_event, ctx) => {
+    activityStore.beginActiveAgentTurn({ status: "running", isCurrent: true });
+    syncStoreFromBranch(ctx);
+  });
+
+  pi.on("turn_start", async (event, ctx) => {
+    const turnIndex = typeof (event as { turnIndex?: unknown }).turnIndex === "number"
+      ? (event as { turnIndex: number }).turnIndex
+      : undefined;
+    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true });
+    syncStoreFromBranch(ctx);
+  });
+
+  pi.on("message_update", async (event, _ctx) => {
+    const message = (event as { message?: unknown }).message;
+    const role = getMessageRole(message);
+    if (role !== "assistant") return;
+    const assistantEvent = (event as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+    const delta = assistantEvent && typeof assistantEvent === "object" && typeof (assistantEvent as { delta?: unknown }).delta === "string"
+      ? (assistantEvent as { delta: string }).delta
+      : null;
+    const current = activityStore.getCurrentTurn();
+    const nextText = delta
+      ? `${current?.streamingText ?? ""}${delta}`
+      : getMessageText(message) ?? current?.streamingText;
+    activityStore.updateActiveAgentTurn({
+      status: "streaming",
+      streamingText: nextText ?? undefined,
+    });
+  });
+
+  pi.on("message_end", async (event, _ctx) => {
+    const message = (event as { message?: unknown }).message;
+    const role = getMessageRole(message);
+    if (role === "user") {
+      const text = getMessageText(message);
+      if (text) activityStore.noteUserInput(text);
+      return;
+    }
+    if (role !== "assistant") return;
+    const text = getMessageText(message);
+    activityStore.updateActiveAgentTurn({
+      status: "streaming",
+      streamingText: text ?? undefined,
+      finalText: text ?? undefined,
+    });
+  });
+
+  pi.on("tool_execution_start", async (event, _ctx) => {
+    handleToolExecution(event, "start");
+  });
+
+  pi.on("tool_execution_update", async (event, _ctx) => {
+    handleToolExecution(event, "update");
+  });
+
+  pi.on("tool_execution_end", async (event, _ctx) => {
+    handleToolExecution(event, "end");
+  });
+
+  pi.on("turn_end", async (event, _ctx) => {
+    const message = (event as { message?: unknown }).message;
+    const role = getMessageRole(message);
+    if (role === "assistant") {
+      const text = getMessageText(message);
+      activityStore.updateActiveAgentTurn({
+        status: "success",
+        streamingText: text ?? undefined,
+        finalText: text ?? undefined,
+      });
+    }
+    activityStore.endActiveAgentTurn({
+      status: "success",
+      turnIndex: typeof (event as { turnIndex?: unknown }).turnIndex === "number"
+        ? (event as { turnIndex: number }).turnIndex
+        : undefined,
+    });
+  });
+
+  pi.on("agent_end", async (_event, _ctx) => {
+    activityStore.endActiveAgentTurn({ status: "success" });
+  });
+
   // Inject available agents into the system prompt, or replace it for active-agent mode.
   pi.on("before_agent_start", async (event) => {
     if (!canDelegate) return;
@@ -930,8 +1075,7 @@ export default function (pi: ExtensionAPI) {
         "Delegate work to specialized subagents running in isolated pi processes.",
         "",
         "IMPORTANT: Use exactly ONE invocation shape:",
-        "  Single mode:   set `agent` and `task` (both required together).",
-        "  Parallel mode: set `tasks` array (do NOT also set `agent`/`task`).",
+        "  Single mode: set `agent` and `task` (both required together).",
         "",
         "Optional context mode switch:",
         "  mode: \"spawn\" (default) -> child gets only your task prompt.",
@@ -945,7 +1089,6 @@ export default function (pi: ExtensionAPI) {
         'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
         'Example line:     { agent: "writer", mode: "spawn", lineId: "readme", task: "Start README work" }',
         'Example continue: { agent: "writer", mode: "continue", lineId: "readme", task: "Continue README work" }',
-        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
       ].join("\n"),
       parameters: SubagentParams,
 
@@ -963,10 +1106,11 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\", \"fork\", or \"continue\".\nAvailable agents: ${formatAgentNames(agents)}`,
+                text: `Invalid mode "${String(params.mode)}". Expected "spawn", "fork", or "continue".
+Available agents: ${formatAgentNames(agents)}`,
               },
             ],
-            details: fallbackDetails("single")([]),
+            details: fallbackDetails([]),
             isError: true,
           };
         }
@@ -975,6 +1119,47 @@ export default function (pi: ExtensionAPI) {
           discovery.projectAgentsDir,
           delegationMode,
         );
+
+        if ((params as Record<string, unknown>).tasks !== undefined) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Parallel mode was removed. Call subagent separately for each agent.",
+              },
+            ],
+            details: makeDetails([]),
+            isError: true,
+          };
+        }
+
+        const agent = trimmedNonEmpty(params.agent);
+        const task = trimmedNonEmpty(params.task);
+        if (!agent || !task) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Invalid parameters. Provide agent and task.",
+              },
+            ],
+            details: makeDetails([]),
+            isError: true,
+          };
+        }
+
+        if (delegationMode === "continue" && (!params.lineId || !params.lineId.trim())) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Invalid parameters: mode=\"continue\" requires lineId. No default line is selected automatically.",
+              },
+            ],
+            details: makeDetails([]),
+            isError: true,
+          };
+        }
 
         let forkSessionSnapshotJsonl: string | undefined;
         if (delegationMode === "fork") {
@@ -989,68 +1174,13 @@ export default function (pi: ExtensionAPI) {
                   text: "Cannot use mode=\"fork\": failed to snapshot current session context.",
                 },
               ],
-              details: makeDetails("single")([]),
+              details: makeDetails([]),
               isError: true,
             };
           }
         }
 
-        // Validate: exactly one invocation shape must be specified
-        const hasTasks = (params.tasks?.length ?? 0) > 0;
-        const hasSingle = Boolean(params.agent && params.task);
-        if (Number(hasTasks) + Number(hasSingle) !== 1) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Invalid parameters. Provide exactly one invocation shape.\nAvailable agents: ${formatAgentNames(agents)}`,
-              },
-            ],
-            details: makeDetails("single")([]),
-          };
-        }
-
-        if (delegationMode === "continue") {
-          if (!params.lineId || !params.lineId.trim()) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Invalid parameters: mode=\"continue\" requires lineId. No default line is selected automatically.",
-                },
-              ],
-              details: makeDetails(hasTasks ? "parallel" : "single")([]),
-              isError: true,
-            };
-          }
-          if (hasTasks) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Invalid parameters: mode=\"continue\" currently supports single mode only. Provide agent, task, and lineId.",
-                },
-              ],
-              details: makeDetails("parallel")([]),
-              isError: true,
-            };
-          }
-        } else if (hasTasks && params.lineId) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Invalid parameters: top-level lineId is only supported for single mode. Parallel line checkpoints are not implemented yet.",
-              },
-            ],
-            details: makeDetails("parallel")([]),
-            isError: true,
-          };
-        }
-
-        const requested = new Set<string>();
-        if (params.tasks) for (const t of params.tasks) requested.add(t.agent);
-        if (params.agent) requested.add(params.agent);
+        const requested = new Set<string>([agent]);
 
         if (preventCycles) {
           const cycleViolations = getCycleViolations(
@@ -1072,134 +1202,110 @@ Current stack: ${stackText}
 This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A).`,
                 },
               ],
-              details: makeDetails(hasTasks ? "parallel" : "single")([]),
+              details: makeDetails([]),
               isError: true,
             };
           }
         }
 
-        // ── Parallel mode ──
-        if (params.tasks && params.tasks.length > 0) {
-          return executeParallel(
-            params.tasks,
-            delegationMode,
-            forkSessionSnapshotJsonl,
-            agents,
-            ctx.cwd,
-            signal,
-            onUpdate,
-            makeDetails,
-          );
-        }
-
-        // ── Single mode ──
-        if (params.agent && params.task) {
-          let continueSessionFile: string | undefined;
-          let continuedFrom: { childSessionId: string; childSessionFile?: string; childLeafId?: string } | undefined;
-          let warning: string | undefined;
-          let copyOnWrite = false;
-          let effectiveTask = params.task;
-          const effectiveCwd = params.cwd ?? ctx.cwd;
-          const worktree = getWorktreeFingerprint(effectiveCwd);
-          if (delegationMode === "continue") {
-            const lineId = params.lineId!.trim();
-            const visibleLine = findVisibleLine(ctx.sessionManager.getBranch(), params.agent, lineId);
-            if (!visibleLine) {
-              const available = formatAvailableLines(ctx.sessionManager.getBranch(), params.agent);
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `No line "${lineId}" for agent "${params.agent}" in current branch, or it is outside the latest 3 visible lines.\n\nAvailable lines for this agent in the current branch:\n${available}`,
-                  },
-                ],
-                details: makeDetails("single")([]),
-                isError: true,
-              };
-            }
-            if (!visibleLine.event.childSessionFile) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Cannot continue line "${lineId}" for agent "${params.agent}": the checkpoint is missing childSessionFile. Re-open this line with spawn/fork and lineId to create a resumable checkpoint.`,
-                  },
-                ],
-                details: makeDetails("single")([]),
-                isError: true,
-              };
-            }
-            continueSessionFile = visibleLine.event.childSessionFile;
-            continuedFrom = {
-              childSessionId: visibleLine.event.childSessionId,
-              childSessionFile: visibleLine.event.childSessionFile,
-              childLeafId: visibleLine.event.childLeafId,
-            };
-            if (needsCopyOnWrite(continueSessionFile, visibleLine.event.childLeafId)) {
-              const materialized = materializeCheckpointSnapshot(continueSessionFile, visibleLine.event.childLeafId!);
-              continueSessionFile = materialized.sessionFile;
-              copyOnWrite = true;
-            }
-            if (hasWorktreeDrift(visibleLine.event.worktree, worktree)) {
-              warning = "Worktree drift detected since this subagent line was last used. The task was prefixed with a reminder to re-read files.";
-              effectiveTask = `${WORKTREE_DRIFT_TASK_PREFIX}${effectiveTask}`;
-            }
-          }
-
-          const lineId = params.lineId?.trim();
-          const runSingle = () => executeSingle(
-            params.agent!,
-            effectiveTask,
-            params.cwd,
-            delegationMode,
-            forkSessionSnapshotJsonl,
-            agents,
-            ctx.cwd,
-            signal,
-            onUpdate,
-            makeDetails,
-            lineId,
-            continueSessionFile,
-            continuedFrom,
-            worktree,
-            warning,
-            copyOnWrite,
-          );
-
-          if (!lineId) return runSingle();
-
-          const parentHeader = ctx.sessionManager.getHeader();
-          const parentSessionId =
-            parentHeader && typeof parentHeader === "object" && "id" in parentHeader
-              ? String((parentHeader as { id?: unknown }).id ?? "unknown")
-              : "unknown";
-          const lockKey = `${parentSessionId}:${params.agent}:${lineId}`;
-          try {
-            return await withLineLock(lockKey, runSingle);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
+        let continueSessionFile: string | undefined;
+        let continuedFrom: { childSessionId: string; childSessionFile?: string; childLeafId?: string } | undefined;
+        let warning: string | undefined;
+        let copyOnWrite = false;
+        let effectiveTask = task;
+        const effectiveCwd = params.cwd ?? ctx.cwd;
+        const worktree = getWorktreeFingerprint(effectiveCwd);
+        if (delegationMode === "continue") {
+          const lineId = params.lineId!.trim();
+          const visibleLine = findVisibleLine(ctx.sessionManager.getBranch(), agent, lineId);
+          if (!visibleLine) {
+            const available = formatAvailableLines(ctx.sessionManager.getBranch(), agent);
             return {
               content: [
                 {
-                  type: "text" as const,
-                  text: message,
+                  type: "text",
+                  text: `No line "${lineId}" for agent "${agent}" in current branch, or it is outside the latest 3 visible lines.
+
+Available lines for this agent in the current branch:
+${available}`,
                 },
               ],
-              details: makeDetails("single")([]),
+              details: makeDetails([]),
               isError: true,
             };
           }
+          if (!visibleLine.event.childSessionFile) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Cannot continue line "${lineId}" for agent "${agent}": the checkpoint is missing childSessionFile. Re-open this line with spawn/fork and lineId to create a resumable checkpoint.`,
+                },
+              ],
+              details: makeDetails([]),
+              isError: true,
+            };
+          }
+          continueSessionFile = visibleLine.event.childSessionFile;
+          continuedFrom = {
+            childSessionId: visibleLine.event.childSessionId,
+            childSessionFile: visibleLine.event.childSessionFile,
+            childLeafId: visibleLine.event.childLeafId,
+          };
+          if (needsCopyOnWrite(continueSessionFile, visibleLine.event.childLeafId)) {
+            const materialized = materializeCheckpointSnapshot(continueSessionFile, visibleLine.event.childLeafId!);
+            continueSessionFile = materialized.sessionFile;
+            copyOnWrite = true;
+          }
+          if (hasWorktreeDrift(visibleLine.event.worktree, worktree)) {
+            warning = "Worktree drift detected since this subagent line was last used. The task was prefixed with a reminder to re-read files.";
+            effectiveTask = `${WORKTREE_DRIFT_TASK_PREFIX}${effectiveTask}`;
+          }
         }
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid parameters. Available agents: ${formatAgentNames(agents)}`,
-            },
-          ],
-          details: makeDetails("single")([]),
-        };
+        const lineId = params.lineId?.trim();
+        const runSingle = () => executeSingle(
+          agent,
+          effectiveTask,
+          params.cwd,
+          delegationMode,
+          forkSessionSnapshotJsonl,
+          agents,
+          ctx.cwd,
+          signal,
+          onUpdate,
+          makeDetails,
+          lineId,
+          continueSessionFile,
+          continuedFrom,
+          worktree,
+          warning,
+          copyOnWrite,
+        );
+
+        if (!lineId) return runSingle();
+
+        const parentHeader = ctx.sessionManager.getHeader();
+        const parentSessionId =
+          parentHeader && typeof parentHeader === "object" && "id" in parentHeader
+            ? String((parentHeader as { id?: unknown }).id ?? "unknown")
+            : "unknown";
+        const lockKey = `${parentSessionId}:${agent}:${lineId}`;
+        try {
+          return await withLineLock(lockKey, runSingle);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: message,
+              },
+            ],
+            details: makeDetails([]),
+            isError: true,
+          };
+        }
       },
 
       renderCall: (args, theme) => renderCall(args, theme),
@@ -1222,7 +1328,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     defaultCwd: string,
     signal: AbortSignal | undefined,
     onUpdate: ((partial: any) => void) | undefined,
-    makeDetails: ReturnType<typeof makeDetailsFactory>,
+    makeDetails: (results: SingleResult[]) => SubagentDetails,
     lineId?: string,
     continueSessionFile?: string,
     continuedFrom?: { childSessionId: string; childSessionFile?: string; childLeafId?: string },
@@ -1250,7 +1356,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       preventCycles,
       signal,
       onUpdate,
-      makeDetails: makeDetails("single"),
+      makeDetails,
     });
 
     if (isResultError(result)) {
@@ -1261,7 +1367,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             text: `Agent ${result.stopReason || "failed"}: ${getResultSummaryText(result)}`,
           },
         ],
-        details: makeDetails("single")([result]),
+        details: makeDetails([result]),
         isError: true,
       };
     }
@@ -1272,115 +1378,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           text: getResultSummaryText(result),
         },
       ],
-      details: makeDetails("single")([result]),
+      details: makeDetails([result]),
     };
   }
 
-  async function executeParallel(
-    tasks: Array<{ agent: string; task: string; cwd?: string }>,
-    delegationMode: DelegationMode,
-    forkSessionSnapshotJsonl: string | undefined,
-    agents: AgentConfig[],
-    defaultCwd: string,
-    signal: AbortSignal | undefined,
-    onUpdate: ((partial: any) => void) | undefined,
-    makeDetails: ReturnType<typeof makeDetailsFactory>,
-  ) {
-    if (tasks.length > MAX_PARALLEL_TASKS) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Too many parallel tasks (${tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-          },
-        ],
-        details: makeDetails("parallel")([]),
-      };
-    }
-
-    // Initialize placeholder results for streaming
-    const allResults: SingleResult[] = tasks.map((t) => ({
-      agent: t.agent,
-      agentSource: "unknown" as const,
-      task: t.task,
-      exitCode: -1,
-      messages: [],
-      stderr: "",
-      usage: emptyUsage(),
-    }));
-
-    const emitProgress = () => {
-      if (!onUpdate) return;
-      const running = allResults.filter((r) => r.exitCode === -1).length;
-      const done = allResults.filter((r) => r.exitCode !== -1).length;
-      onUpdate({
-        content: [
-          {
-            type: "text",
-            text: `Parallel: ${done}/${allResults.length} done, ${running} running...`,
-          },
-        ],
-        details: makeDetails("parallel")([...allResults]),
-      });
-    };
-
-    let heartbeat: NodeJS.Timeout | undefined;
-    if (onUpdate) {
-      emitProgress();
-      heartbeat = setInterval(() => {
-        if (allResults.some((r) => r.exitCode === -1)) emitProgress();
-      }, PARALLEL_HEARTBEAT_MS);
-    }
-
-    let results: SingleResult[];
-    try {
-      results = await mapConcurrent(
-        tasks,
-        MAX_CONCURRENCY,
-        async (t, index) => {
-          const result = await runAgent({
-            cwd: defaultCwd,
-            agents,
-            agentName: t.agent,
-            task: t.task,
-            taskCwd: t.cwd,
-            delegationMode,
-            forkSessionSnapshotJsonl,
-            parentDepth: currentDepth,
-            parentAgentStack: ancestorAgentStack,
-            maxDepth,
-            preventCycles,
-            signal,
-            onUpdate: (partial) => {
-              if (partial.details?.results[0]) {
-                allResults[index] = partial.details.results[0];
-                emitProgress();
-              }
-            },
-            makeDetails: makeDetails("parallel"),
-          });
-          allResults[index] = result;
-          emitProgress();
-          return result;
-        },
-      );
-    } finally {
-      if (heartbeat) clearInterval(heartbeat);
-    }
-
-    const successCount = results.filter((r) => isResultSuccess(r)).length;
-    const summaries = results.map((r) =>
-      `[${r.agent}] ${isResultError(r) ? "failed" : "completed"}: ${getResultSummaryText(r)}`,
-    );
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
-        },
-      ],
-      details: makeDetails("parallel")(results),
-    };
-  }
 }

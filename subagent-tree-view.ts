@@ -1,13 +1,18 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import {
+  type ActivityStore,
   type FlatSubagentNode,
   type SubagentTreeNode,
+  buildActivityTreeFromBranch,
   buildAgentDetailLines,
-  buildCallDetailLines,
   buildSubagentTree,
+  createActivityStore,
   flattenSubagentTree,
-  statusIcon,
+  getSubagentTreeSignature,
+  preserveSelectionIndex,
+  statusBadge,
+  summarizeSubagentTree,
 } from "./subagent-view-data.js";
 
 type Theme = {
@@ -18,11 +23,21 @@ type Theme = {
 type Done = (value: void) => void;
 type RequestRender = (force?: boolean) => void;
 
+export interface SubagentViewerContext {
+  hasUI: boolean;
+  cwd: string;
+  sessionManager: Pick<ExtensionContext["sessionManager"], "getBranch" | "getHeader">;
+  ui?: Pick<ExtensionContext["ui"], "custom" | "notify">;
+  activityStore?: Pick<ActivityStore, "getTree" | "getSignature" | "subscribe">;
+}
+
 type Mode = "tree" | "detail";
 
 const BODY_HEIGHT = 24;
 const TREE_FOOTER_LINES = 5;
 const TREE_MAX_LINES = BODY_HEIGHT - TREE_FOOTER_LINES;
+const REFRESH_INTERVAL_MS = 1000;
+const DETAIL_BODY_LINES = BODY_HEIGHT - 2;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -44,30 +59,123 @@ function wrapPlainLines(lines: string[], width: number): string[] {
   return result;
 }
 
+export function preserveDetailScrollAfterRefresh(
+  previousMode: Mode,
+  previousSelectedNodeId: string | null,
+  nextSelectedNode: SubagentTreeNode | undefined,
+  previousDetailScroll: number,
+): number {
+  if (previousMode !== "detail") return 0;
+  if (!nextSelectedNode || nextSelectedNode.kind === "session") return 0;
+  if (nextSelectedNode.id !== previousSelectedNodeId) return 0;
+  const wrappedDetailLength = buildAgentDetailLines(nextSelectedNode).length;
+  const maxScroll = Math.max(0, wrappedDetailLength - DETAIL_BODY_LINES);
+  return clamp(previousDetailScroll, 0, maxScroll);
+}
+
 class SubagentViewerComponent {
   private mode: Mode = "tree";
   private selected = 0;
   private detailScroll = 0;
-  private readonly root: SubagentTreeNode;
-  private readonly flat: FlatSubagentNode[];
+  private root: SubagentTreeNode;
+  private flat: FlatSubagentNode[];
   private readonly theme: Theme;
   private readonly requestRender: RequestRender;
   private readonly done: Done;
+  private readonly getBranch: () => unknown[];
+  private readonly activityStore?: Pick<ActivityStore, "getTree" | "getSignature" | "subscribe">;
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private unsubscribeStore: (() => void) | null = null;
+  private currentSignature = "";
+  private disposed = false;
   private cachedWidth?: number;
   private cachedLines?: string[];
 
   constructor(
-    branch: unknown[],
+    getBranch: () => unknown[],
     theme: Theme,
     requestRender: RequestRender,
     done: Done,
+    activityStore?: Pick<ActivityStore, "getTree" | "getSignature" | "subscribe">,
   ) {
     this.theme = theme;
     this.requestRender = requestRender;
     this.done = done;
-    this.root = buildSubagentTree(branch);
+    this.getBranch = getBranch;
+    this.activityStore = activityStore;
+    this.root = this.readTree();
     this.flat = flattenSubagentTree(this.root);
     this.selected = this.flat.length > 1 ? 1 : 0;
+    this.currentSignature = this.readSignature(this.root);
+    if (this.activityStore) {
+      this.unsubscribeStore = this.activityStore.subscribe(() => this.refreshFromStore());
+    }
+    this.startRefreshTimer();
+  }
+
+  private startRefreshTimer(): void {
+    this.refreshTimer = setInterval(() => {
+      this.refreshFromBranch();
+    }, REFRESH_INTERVAL_MS);
+    this.refreshTimer?.unref?.();
+  }
+
+  private readTree(): SubagentTreeNode {
+    return this.activityStore ? this.activityStore.getTree() : buildActivityTreeFromBranch(this.getBranch());
+  }
+
+  private readSignature(root: SubagentTreeNode): string {
+    return this.activityStore ? this.activityStore.getSignature() : getSubagentTreeSignature(root);
+  }
+
+  private refreshFromStore(): void {
+    if (this.disposed) return;
+    const nextRoot = this.readTree();
+    const nextSignature = this.readSignature(nextRoot);
+    if (nextSignature === this.currentSignature) return;
+
+    const previousMode = this.mode;
+    const previousSelectedId = this.flat[this.selected]?.node.id ?? null;
+    const previousSelectedIndex = this.selected;
+    const previousDetailScroll = this.detailScroll;
+
+    this.root = nextRoot;
+    this.flat = flattenSubagentTree(this.root);
+    this.selected = preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex);
+    this.currentSignature = nextSignature;
+    this.detailScroll = preserveDetailScrollAfterRefresh(
+      previousMode,
+      previousSelectedId,
+      this.flat[this.selected]?.node,
+      previousDetailScroll,
+    );
+    this.invalidate();
+    this.requestRender(true);
+  }
+
+  private refreshFromBranch(): void {
+    if (this.disposed || this.activityStore) return;
+    const nextRoot = this.readTree();
+    const nextSignature = this.readSignature(nextRoot);
+    if (nextSignature === this.currentSignature) return;
+
+    const previousMode = this.mode;
+    const previousSelectedId = this.flat[this.selected]?.node.id ?? null;
+    const previousSelectedIndex = this.selected;
+    const previousDetailScroll = this.detailScroll;
+
+    this.root = nextRoot;
+    this.flat = flattenSubagentTree(this.root);
+    this.selected = preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex);
+    this.currentSignature = nextSignature;
+    this.detailScroll = preserveDetailScrollAfterRefresh(
+      previousMode,
+      previousSelectedId,
+      this.flat[this.selected]?.node,
+      previousDetailScroll,
+    );
+    this.invalidate();
+    this.requestRender(true);
   }
 
   invalidate(): void {
@@ -88,8 +196,17 @@ class SubagentViewerComponent {
     this.requestRender(true);
   }
 
+  dispose(): void {
+    this.disposed = true;
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  }
+
   private handleTreeInput(data: string): void {
     if (data === "q" || data === "Q" || matchesKey(data, "escape")) {
+      this.dispose();
       this.done(undefined);
       return;
     }
@@ -109,7 +226,7 @@ class SubagentViewerComponent {
       if (node?.children[0]) this.selected = this.flat.findIndex((row) => row.node === node.children[0]);
     } else if (matchesKey(data, "return") || matchesKey(data, "enter")) {
       const node = this.flat[this.selected]?.node;
-      if (node && (node.kind === "agent" || node.kind === "call")) {
+      if (node?.kind !== "session") {
         this.mode = "detail";
         this.detailScroll = 0;
       }
@@ -119,12 +236,12 @@ class SubagentViewerComponent {
   private detailLines(): string[] {
     const node = this.flat[this.selected]?.node;
     if (!node) return ["No selection"];
-    if (node.kind === "call") return buildCallDetailLines(node);
     return buildAgentDetailLines(node);
   }
 
   private handleDetailInput(data: string): void {
     if (data === "q" || data === "Q") {
+      this.dispose();
       this.done(undefined);
       return;
     }
@@ -148,7 +265,7 @@ class SubagentViewerComponent {
   render(width: number): string[] {
     if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
     const contentWidth = Math.max(20, width - 4);
-    const title = this.mode === "detail" ? "Subagent detail" : "Subagents";
+    const title = this.mode === "detail" ? "Node detail" : "Activity tree";
     const lines: string[] = [];
     const titleLabel = `─ ${title} `;
     lines.push(this.theme.fg("accent", `╭${titleLabel}${"─".repeat(Math.max(0, contentWidth + 2 - visibleWidth(titleLabel)))}╮`));
@@ -165,9 +282,9 @@ class SubagentViewerComponent {
   private renderTreeBody(width: number): string[] {
     if (this.root.children.length === 0) {
       const empty: string[] = [
-        this.theme.fg("muted", "No subagent records in the current session branch."),
+        this.theme.fg("muted", "No active-agent turns or subagents in the current session branch."),
         "",
-        this.theme.fg("dim", "Run the subagent tool, then open this viewer again."),
+        this.theme.fg("dim", "Trigger a new user message or run the subagent tool, then reopen this viewer."),
         "",
         this.theme.fg("dim", "q/Esc close"),
       ];
@@ -181,18 +298,28 @@ class SubagentViewerComponent {
       const isSelected = index === this.selected;
       const prefix = isSelected ? this.theme.fg("accent", "› ") : "  ";
       const branch = row.depth === 0 ? "" : `${"│  ".repeat(Math.max(0, row.depth - 1))}${this.isLastChild(row) ? "└─ " : "├─ "}`;
-      const icon = row.node.displayState === "blocked" ? "" : ` ${statusIcon(row.node.status)}`;
+      const icon = ` ${statusBadge(row.node.status)}`;
       const text = `${prefix}${branch}${row.node.label}${icon}`;
-      if (isSelected) return this.theme.fg("accent", text);
-      if (row.node.displayState === "blocked") return this.theme.fg("dim", text);
-      return text;
+      return isSelected ? this.theme.fg("accent", text) : text;
     });
     while (rows.length < TREE_MAX_LINES) rows.push("");
 
     const selectedNode = this.flat[this.selected]?.node;
     const selectedResult = selectedNode?.result;
+    const summary = summarizeSubagentTree(this.root);
     rows.push("");
-    rows.push(this.theme.fg("muted", `Selected: ${selectedNode ? `${selectedNode.label}${selectedNode.displayState === "blocked" ? "" : ` ${statusIcon(selectedNode.status)}`}` : "none"}`));
+    rows.push(
+      this.theme.fg(
+        "muted",
+        `Selected: ${selectedNode ? `${selectedNode.label} ${statusBadge(selectedNode.status)}` : "none"}`,
+      ),
+    );
+    rows.push(
+      this.theme.fg(
+        "dim",
+        `Live: ${statusBadge(selectedNode?.status ?? "success")}  Running ${summary.running}/${summary.total} · Total ${summary.total}`,
+      ),
+    );
     rows.push(selectedResult?.task ? this.theme.fg("dim", `Task: ${selectedResult.task}`) : "");
     rows.push("");
     rows.push(this.theme.fg("dim", "↑↓ move  ← parent  → child  Enter open  q/Esc close"));
@@ -207,21 +334,28 @@ class SubagentViewerComponent {
   private renderDetailBody(width: number): string[] {
     const raw = this.detailLines();
     const wrapped = wrapPlainLines(raw, width);
-    const maxScroll = Math.max(0, wrapped.length - BODY_HEIGHT + 2);
+    const maxScroll = Math.max(0, wrapped.length - DETAIL_BODY_LINES);
     this.detailScroll = clamp(this.detailScroll, 0, maxScroll);
-    const visible = wrapped.slice(this.detailScroll, this.detailScroll + BODY_HEIGHT - 2);
-    while (visible.length < BODY_HEIGHT - 2) visible.push("");
+    const visible = wrapped.slice(this.detailScroll, this.detailScroll + DETAIL_BODY_LINES);
+    while (visible.length < DETAIL_BODY_LINES) visible.push("");
+    const node = this.flat[this.selected]?.node;
     visible.push("");
+    visible.push(
+      this.theme.fg(
+        "dim",
+        `Live: ${statusBadge(node?.status ?? "success")}  ${node ? node.label : "No selection"}`,
+      ),
+    );
     visible.push(this.theme.fg("dim", "↑↓/PgUp/PgDn scroll  Esc back  q close"));
     return visible.map((line) => padLine(line, width));
   }
 }
 
-export async function openSubagentViewer(ctx: ExtensionContext): Promise<void> {
+export async function openSubagentViewer(ctx: SubagentViewerContext): Promise<void> {
   if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.custom !== "function") return;
-  const branch = ctx.sessionManager.getBranch();
+  const getBranch = () => ctx.sessionManager.getBranch();
   await ctx.ui.custom<void>((tui: { requestRender: RequestRender }, theme: Theme, _keybindings: unknown, done: Done) => {
-    const component = new SubagentViewerComponent(branch, theme, (force?: boolean) => tui.requestRender(force), done);
+    const component = new SubagentViewerComponent(getBranch, theme, (force?: boolean) => tui.requestRender(force), done);
     return component;
   }, {
     overlay: true,

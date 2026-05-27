@@ -4,9 +4,6 @@
   "workspaces": {
     "": {
       "name": "@mjakl/pi-subagent",
-      "dependencies": {
-        "@mjakl/pi-subagent": ".",
-      },
       "devDependencies": {
         "@types/node": "^25.2.3",
         "typescript": "^5.9.3",

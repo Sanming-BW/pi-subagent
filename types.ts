@@ -71,7 +71,7 @@ export interface SingleResult {
 
 /** Metadata attached to every tool result for rendering. */
 export interface SubagentDetails {
-	mode: "single" | "parallel";
+	mode: "single";
 	delegationMode: DelegationMode;
 	projectAgentsDir: string | null;
 	results: SingleResult[];

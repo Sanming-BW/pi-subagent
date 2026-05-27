@@ -1,11 +1,22 @@
+// @ts-check
 /**
  * Helpers for inheriting selected parent CLI flags in child subagent processes.
+ *
+ * @typedef {{
+ *   extensionArgs: string[];
+ *   alwaysProxy: string[];
+ *   fallbackModel?: string;
+ *   fallbackThinking?: string;
+ *   fallbackTools?: string;
+ *   fallbackNoTools: boolean;
+ * }} InheritedCliArgs
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+/** @param {string} value */
 function looksLikeExplicitRelativePath(value) {
   return (
     value.startsWith("./") ||
@@ -15,6 +26,10 @@ function looksLikeExplicitRelativePath(value) {
   );
 }
 
+/**
+ * @param {string} value
+ * @param {{ allowPackageSource?: boolean; alwaysResolveRelative?: boolean }} [options]
+ */
 function resolvePathArg(value, options = {}) {
   const { allowPackageSource = false, alwaysResolveRelative = false } = options;
   if (!value) return value;
@@ -40,6 +55,12 @@ function resolvePathArg(value, options = {}) {
  * - extensionArgs: forwarded with path resolution
  * - alwaysProxy: forwarded verbatim to every child
  * - fallbackModel/thinking/tools: used only when the agent file does not set them
+ */
+/**
+ * Parse process.argv into groups used for child pi invocations.
+ *
+ * @param {string[]} argv
+ * @returns {InheritedCliArgs}
  */
 export function parseInheritedCliArgs(argv) {
   const extensionArgs = [];

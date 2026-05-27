@@ -21,6 +21,8 @@
     "worktree-fingerprint.ts",
     "render.ts",
     "types.ts",
+    "runner-cli.d.ts",
+    "runner-events.d.ts",
     "agents/*.md",
     "README.md",
     "LICENSE"
@@ -84,8 +86,5 @@
     "@sinclair/typebox": {
       "optional": true
     }
-  },
-  "dependencies": {
-    "@mjakl/pi-subagent": "."
   }
 }

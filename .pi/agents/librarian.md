@@ -1,5 +1,5 @@
 ---
-name: librarian
+name: Librarian
 description: Explore and summarize target, project, and local content such as repository docs, files, references, and notes without modifying them.
 model: axonhub/mimo-v2.5
 thinking: medium

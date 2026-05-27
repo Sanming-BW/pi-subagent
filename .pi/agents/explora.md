@@ -1,5 +1,5 @@
 ---
-name: explora
+name: Explorer
 description: Explore network and web content, using available web-oriented skills, CLIs, and MCP tools to research and summarize external information.
 model: axonhub/mimo-v2.5
 thinking: medium
