@@ -177,3 +177,100 @@ test("tool_execution_end with malformed subagent details is ignored", () => {
   assert.equal(processPiEvent(event, result), false);
   assert.equal(result.nestedDetails, undefined);
 });
+
+test("tool execution lifecycle creates and merges live nested subagent results by toolCallId", () => {
+  const result = makeResult();
+
+  const start = {
+    type: "tool_execution_start",
+    toolCallId: "call_99",
+    toolName: "subagent",
+    args: { agent: "planner", task: "make a plan", mode: "spawn" },
+  };
+  const update = {
+    type: "tool_execution_update",
+    toolCallId: "call_99",
+    toolName: "subagent",
+    partialResult: {
+      content: { kind: "wrapper" },
+      details: {
+        mode: "single",
+        delegationMode: "spawn",
+        projectAgentsDir: null,
+        results: [
+          {
+            agent: "planner",
+            agentSource: "user",
+            task: "make a plan",
+            exitCode: -1,
+            messages: [],
+            stderr: "",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+            toolCallId: "call_99",
+          },
+        ],
+      },
+    },
+  };
+  const end = {
+    type: "tool_execution_end",
+    toolCallId: "call_99",
+    toolName: "subagent",
+    result: {
+      content: [{ type: "text", text: "done" }],
+      details: {
+        mode: "single",
+        delegationMode: "spawn",
+        projectAgentsDir: null,
+        results: [
+          {
+            agent: "planner",
+            agentSource: "user",
+            task: "make a plan",
+            exitCode: 0,
+            messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 1 }],
+            stderr: "",
+            usage: {
+              input: 1,
+              output: 2,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 3,
+              turns: 1,
+            },
+            toolCallId: "call_99",
+          },
+        ],
+      },
+      isError: false,
+    },
+  };
+
+  assert.equal(processPiEvent(start, result), true);
+  assert.equal(result.nestedDetails?.length, 1);
+  assert.equal(result.nestedDetails[0].results[0].exitCode, -1);
+  assert.equal(result.nestedDetails[0].results[0].toolCallId, "call_99");
+
+  assert.equal(processPiEvent(update, result), true);
+  assert.equal(result.nestedDetails?.length, 1);
+  assert.equal(result.nestedDetails[0].results[0].exitCode, -1);
+  assert.equal(result.nestedDetails[0].results[0].task, "make a plan");
+
+  assert.equal(processPiEvent(end, result), true);
+  assert.equal(result.nestedDetails?.length, 1);
+  assert.equal(result.nestedDetails[0].results[0].exitCode, 0);
+  assert.equal(getFinalAssistantText(result.nestedDetails[0].results[0].messages), "done");
+
+  // An out-of-order late end should merge into the same live record instead of duplicating.
+  assert.equal(processPiEvent(end, result), false);
+  assert.equal(result.nestedDetails.length, 1);
+});

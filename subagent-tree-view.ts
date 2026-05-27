@@ -59,6 +59,88 @@ function wrapPlainLines(lines: string[], width: number): string[] {
   return result;
 }
 
+export interface VisibleSubagentTreeRow extends FlatSubagentNode {
+  flatIndex: number;
+  visibleParent: SubagentTreeNode | null;
+  visibleDepth: number;
+}
+
+export function getVisibleSubagentTreeRows(flat: FlatSubagentNode[]): VisibleSubagentTreeRow[] {
+  return flat.slice(1).map((row, flatIndex) => ({
+    ...row,
+    flatIndex: flatIndex + 1,
+    visibleParent: row.parent && row.parent.kind !== "session" && row.parent.kind !== "root" ? row.parent : null,
+    visibleDepth: Math.max(0, row.depth - 1),
+  }));
+}
+
+export function getVisibleSubagentTreeSelectedVisibleIndex(flat: FlatSubagentNode[], selectedFlatIndex: number): number {
+  return getVisibleSubagentTreeRows(flat).findIndex((row) => row.flatIndex === selectedFlatIndex);
+}
+
+export function getVisibleSubagentTreeFlatIndexFromVisibleIndex(flat: FlatSubagentNode[], visibleIndex: number): number {
+  const rows = getVisibleSubagentTreeRows(flat);
+  if (rows.length === 0) return 0;
+  const clampedIndex = clamp(visibleIndex, 0, rows.length - 1);
+  return rows[clampedIndex]?.flatIndex ?? rows[0]!.flatIndex;
+}
+
+export function normalizeVisibleSubagentSelection(flat: FlatSubagentNode[], selectedFlatIndex: number): number {
+  const visibleIndex = getVisibleSubagentTreeSelectedVisibleIndex(flat, selectedFlatIndex);
+  if (visibleIndex >= 0) return selectedFlatIndex;
+  return getVisibleSubagentTreeFlatIndexFromVisibleIndex(flat, 0);
+}
+
+export function getVisibleSubagentTreeTurnGutterWidth(rows: VisibleSubagentTreeRow[]): number {
+  let width = 1;
+  for (const row of rows) {
+    if (row.visibleDepth !== 0) continue;
+    const index = row.node.turnIndex ?? row.node.orderKey ?? 0;
+    width = Math.max(width, visibleWidth(`#${index}`));
+  }
+  return width;
+}
+
+export function getVisibleSubagentTreeLabel(row: VisibleSubagentTreeRow): string {
+  if (row.node.kind === "active-agent-turn") {
+    const activeAgentName = typeof row.node.activeAgentName === "string"
+      ? row.node.activeAgentName.trim()
+      : "";
+    if (activeAgentName) return activeAgentName;
+
+    const index = row.node.turnIndex ?? row.node.orderKey ?? 0;
+    const prefix = row.node.recovered ? "Recovered turn" : "Turn";
+    return `${prefix} #${index}`;
+  }
+  if (row.node.kind === "subagent" && row.node.toolName && row.node.label.startsWith(`${row.node.toolName} `)) {
+    return row.node.label.slice(row.node.toolName.length + 1);
+  }
+  return row.node.label;
+}
+
+export function formatVisibleSubagentTreeRow(
+  row: VisibleSubagentTreeRow,
+  selected: boolean,
+  turnGutterWidth: number,
+): string {
+  const selector = selected ? "› " : "  ";
+  const turnIndex = row.node.turnIndex ?? row.node.orderKey ?? 0;
+  const turnGutter = row.visibleDepth === 0
+    ? `#${turnIndex}`.padStart(turnGutterWidth, " ")
+    : " ".repeat(turnGutterWidth);
+  const gutter = `${turnGutter} │ `;
+  const branch = row.visibleDepth === 0
+    ? ""
+    : `${"│  ".repeat(Math.max(0, row.visibleDepth - 1))}${row.visibleParent && row.visibleParent.children[row.visibleParent.children.length - 1] === row.node ? "└─ " : "├─ "}`;
+  return `${selector}${gutter}${branch}${getVisibleSubagentTreeLabel(row)} ${statusBadge(row.node.status)}`;
+}
+
+export function buildVisibleSubagentTreeRows(flat: FlatSubagentNode[], selectedIndex: number): string[] {
+  const visibleRows = getVisibleSubagentTreeRows(flat);
+  const turnGutterWidth = getVisibleSubagentTreeTurnGutterWidth(visibleRows);
+  return visibleRows.map((row) => formatVisibleSubagentTreeRow(row, row.flatIndex === selectedIndex, turnGutterWidth));
+}
+
 export function preserveDetailScrollAfterRefresh(
   previousMode: Mode,
   previousSelectedNodeId: string | null,
@@ -105,12 +187,13 @@ class SubagentViewerComponent {
     this.activityStore = activityStore;
     this.root = this.readTree();
     this.flat = flattenSubagentTree(this.root);
-    this.selected = this.flat.length > 1 ? 1 : 0;
+    this.selected = normalizeVisibleSubagentSelection(this.flat, this.flat.length > 1 ? 1 : 0);
     this.currentSignature = this.readSignature(this.root);
     if (this.activityStore) {
       this.unsubscribeStore = this.activityStore.subscribe(() => this.refreshFromStore());
+    } else {
+      this.startRefreshTimer();
     }
-    this.startRefreshTimer();
   }
 
   private startRefreshTimer(): void {
@@ -141,7 +224,10 @@ class SubagentViewerComponent {
 
     this.root = nextRoot;
     this.flat = flattenSubagentTree(this.root);
-    this.selected = preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex);
+    this.selected = normalizeVisibleSubagentSelection(
+      this.flat,
+      preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex),
+    );
     this.currentSignature = nextSignature;
     this.detailScroll = preserveDetailScrollAfterRefresh(
       previousMode,
@@ -166,7 +252,10 @@ class SubagentViewerComponent {
 
     this.root = nextRoot;
     this.flat = flattenSubagentTree(this.root);
-    this.selected = preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex);
+    this.selected = normalizeVisibleSubagentSelection(
+      this.flat,
+      preserveSelectionIndex(this.flat, previousSelectedId, previousSelectedIndex),
+    );
     this.currentSignature = nextSignature;
     this.detailScroll = preserveDetailScrollAfterRefresh(
       previousMode,
@@ -202,6 +291,10 @@ class SubagentViewerComponent {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
     }
+    if (this.unsubscribeStore) {
+      this.unsubscribeStore();
+      this.unsubscribeStore = null;
+    }
   }
 
   private handleTreeInput(data: string): void {
@@ -210,20 +303,31 @@ class SubagentViewerComponent {
       this.done(undefined);
       return;
     }
+    const visibleRows = getVisibleSubagentTreeRows(this.flat);
+    const currentVisibleIndex = getVisibleSubagentTreeSelectedVisibleIndex(this.flat, this.selected);
+    const nextVisibleIndex = currentVisibleIndex >= 0 ? currentVisibleIndex : 0;
     if (matchesKey(data, "up")) {
-      this.selected = clamp(this.selected - 1, 0, this.flat.length - 1);
+      this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, nextVisibleIndex - 1);
     } else if (matchesKey(data, "down")) {
-      this.selected = clamp(this.selected + 1, 0, this.flat.length - 1);
+      this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, nextVisibleIndex + 1);
     } else if (matchesKey(data, "home")) {
-      this.selected = 0;
+      this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, 0);
     } else if (matchesKey(data, "end")) {
-      this.selected = this.flat.length - 1;
+      this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, visibleRows.length - 1);
     } else if (matchesKey(data, "left")) {
       const parent = this.flat[this.selected]?.parent;
-      if (parent) this.selected = this.flat.findIndex((row) => row.node === parent);
+      if (parent) {
+        const parentFlatIndex = this.flat.findIndex((row) => row.node === parent);
+        const parentVisibleIndex = getVisibleSubagentTreeSelectedVisibleIndex(this.flat, parentFlatIndex);
+        if (parentVisibleIndex >= 0) this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, parentVisibleIndex);
+      }
     } else if (matchesKey(data, "right")) {
       const node = this.flat[this.selected]?.node;
-      if (node?.children[0]) this.selected = this.flat.findIndex((row) => row.node === node.children[0]);
+      if (node?.children[0]) {
+        const childFlatIndex = this.flat.findIndex((row) => row.node === node.children[0]);
+        const childVisibleIndex = getVisibleSubagentTreeSelectedVisibleIndex(this.flat, childFlatIndex);
+        if (childVisibleIndex >= 0) this.selected = getVisibleSubagentTreeFlatIndexFromVisibleIndex(this.flat, childVisibleIndex);
+      }
     } else if (matchesKey(data, "return") || matchesKey(data, "enter")) {
       const node = this.flat[this.selected]?.node;
       if (node?.kind !== "session") {
@@ -292,14 +396,16 @@ class SubagentViewerComponent {
       return empty.map((line) => padLine(line, width));
     }
 
-    const start = clamp(this.selected - Math.floor(TREE_MAX_LINES / 2), 0, Math.max(0, this.flat.length - TREE_MAX_LINES));
-    const rows: string[] = this.flat.slice(start, start + TREE_MAX_LINES).map((row, visibleIndex) => {
-      const index = start + visibleIndex;
-      const isSelected = index === this.selected;
-      const prefix = isSelected ? this.theme.fg("accent", "› ") : "  ";
-      const branch = row.depth === 0 ? "" : `${"│  ".repeat(Math.max(0, row.depth - 1))}${this.isLastChild(row) ? "└─ " : "├─ "}`;
-      const icon = ` ${statusBadge(row.node.status)}`;
-      const text = `${prefix}${branch}${row.node.label}${icon}`;
+    const visibleRows = getVisibleSubagentTreeRows(this.flat);
+    const selectedVisibleIndex = getVisibleSubagentTreeSelectedVisibleIndex(this.flat, this.selected);
+    const safeSelectedVisibleIndex = selectedVisibleIndex >= 0 ? selectedVisibleIndex : 0;
+    const start = clamp(safeSelectedVisibleIndex - Math.floor(TREE_MAX_LINES / 2), 0, Math.max(0, visibleRows.length - TREE_MAX_LINES));
+    const end = Math.min(visibleRows.length, start + TREE_MAX_LINES);
+    const visibleWindow = visibleRows.slice(start, end);
+    const turnGutterWidth = getVisibleSubagentTreeTurnGutterWidth(visibleWindow);
+    const rows: string[] = visibleWindow.map((row) => {
+      const isSelected = row.flatIndex === this.selected;
+      const text = formatVisibleSubagentTreeRow(row, isSelected, turnGutterWidth);
       return isSelected ? this.theme.fg("accent", text) : text;
     });
     while (rows.length < TREE_MAX_LINES) rows.push("");
@@ -326,11 +432,6 @@ class SubagentViewerComponent {
     return rows.map((line) => padLine(line, width));
   }
 
-  private isLastChild(row: FlatSubagentNode): boolean {
-    if (!row.parent) return true;
-    return row.parent.children[row.parent.children.length - 1] === row.node;
-  }
-
   private renderDetailBody(width: number): string[] {
     const raw = this.detailLines();
     const wrapped = wrapPlainLines(raw, width);
@@ -355,15 +456,15 @@ export async function openSubagentViewer(ctx: SubagentViewerContext): Promise<vo
   if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.custom !== "function") return;
   const getBranch = () => ctx.sessionManager.getBranch();
   await ctx.ui.custom<void>((tui: { requestRender: RequestRender }, theme: Theme, _keybindings: unknown, done: Done) => {
-    const component = new SubagentViewerComponent(getBranch, theme, (force?: boolean) => tui.requestRender(force), done);
+    const component = new SubagentViewerComponent(getBranch, theme, (force?: boolean) => tui.requestRender(force), done, ctx.activityStore);
     return component;
   }, {
     overlay: true,
     overlayOptions: {
       width: "100%",
-      maxHeight: "90%",
+      maxHeight: "100%",
       anchor: "center",
-      margin: 1,
+      margin: 0,
     },
   });
 }

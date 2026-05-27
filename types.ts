@@ -63,6 +63,7 @@ export interface SingleResult {
 	childSessionId?: string;
 	childSessionFile?: string;
 	childLeafId?: string;
+	toolCallId?: string;
 	lineEvent?: SubagentLineEvent;
 	warning?: string;
 	/** Subagent tool calls observed inside this child's run (one entry per call). */

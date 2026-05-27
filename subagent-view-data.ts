@@ -35,6 +35,7 @@ export interface SubagentTreeNode {
   previousTurnId?: string | null;
   isCurrent?: boolean;
   recovered?: boolean;
+  activeAgentName?: string;
   userMessagePreview?: string;
   streamingText?: string;
   finalText?: string;
@@ -42,6 +43,7 @@ export interface SubagentTreeNode {
   projectAgentsDir?: string | null;
   toolCallId?: string;
   toolName?: string;
+  toolArgsSignature?: string;
   result?: SingleResult;
   children: SubagentTreeNode[];
 }
@@ -79,6 +81,7 @@ export interface ActivityStoreTurnInput {
   streamingText?: string;
   finalText?: string;
   recovered?: boolean;
+  activeAgentName?: string;
   isCurrent?: boolean;
   forceNew?: boolean;
   status?: SubagentNodeStatus;
@@ -232,6 +235,10 @@ function isTerminalStatus(status: SubagentNodeStatus): boolean {
   return status === "success" || status === "error" || status === "cancelled" || status === "mixed";
 }
 
+function isActiveStatus(status: SubagentNodeStatus): boolean {
+  return status === "pending" || status === "running" || status === "streaming";
+}
+
 function mergeStatus(current: SubagentNodeStatus, next: SubagentNodeStatus): SubagentNodeStatus {
   if (current === next) return current;
   if (current === "cancelled") return "cancelled";
@@ -249,7 +256,7 @@ function mergeStatus(current: SubagentNodeStatus, next: SubagentNodeStatus): Sub
   return statusRank(next) >= statusRank(current) ? next : current;
 }
 
-function statusIcon(status: SubagentNodeStatus): string {
+export function statusIcon(status: SubagentNodeStatus): string {
   switch (status) {
     case "pending": return "◌";
     case "running": return "⏳";
@@ -315,15 +322,20 @@ function createLegacyAgentNode(
   return node;
 }
 
-function createTurnLabel(turn: SubagentTreeNode): string {
+function createTurnLabel(turn: Pick<SubagentTreeNode, "turnIndex" | "orderKey" | "recovered" | "activeAgentName">): string {
   const index = turn.turnIndex ?? turn.orderKey ?? 0;
   const prefix = turn.recovered ? "Recovered turn" : "Turn";
-  return `${prefix} #${index}`;
+  const agent = typeof turn.activeAgentName === "string" && turn.activeAgentName.trim() ? ` · ${turn.activeAgentName.trim()}` : "";
+  return `${prefix} #${index}${agent}`;
+}
+
+function refreshTurnLabel(turn: Pick<SubagentTreeNode, "turnIndex" | "orderKey" | "recovered" | "activeAgentName" | "userMessagePreview">): string {
+  return `${createTurnLabel(turn)}${turn.userMessagePreview ? ` · ${turn.userMessagePreview}` : ""}`;
 }
 
 function createTurnNode(sessionId: string | null, input: ActivityStoreTurnInput = {}, previousTurnId?: string | null, orderKey = 0): SubagentTreeNode {
   const turnIndex = input.turnIndex ?? orderKey;
-  const baseLabel = createTurnLabel({ turnIndex, orderKey, recovered: input.recovered } as SubagentTreeNode);
+  const baseLabel = createTurnLabel({ turnIndex, orderKey, recovered: input.recovered, activeAgentName: input.activeAgentName });
   const node: SubagentTreeNode = {
     id: `turn-${orderKey}`,
     kind: "active-agent-turn",
@@ -336,6 +348,7 @@ function createTurnNode(sessionId: string | null, input: ActivityStoreTurnInput 
     previousTurnId,
     isCurrent: input.isCurrent ?? true,
     recovered: input.recovered ?? false,
+    activeAgentName: input.activeAgentName,
     userMessagePreview: input.userMessagePreview,
     streamingText: input.streamingText,
     finalText: input.finalText,
@@ -359,6 +372,7 @@ function createSubagentNode(
 ): SubagentTreeNode {
   const toolCallId = typeof input.toolCallId === "string" && input.toolCallId.trim() ? input.toolCallId.trim() : undefined;
   const result = parseSubagentResult(input.result);
+  const toolArgsSignature = input.args ? stableStringify(input.args) : undefined;
   const label = createSubagentLabel(result, input.toolName, toolCallId);
   return {
     id: toolCallId ? `subagent:${toolCallId}` : `subagent:${parentTurnId}:${orderKey}`,
@@ -370,6 +384,7 @@ function createSubagentNode(
     orderKey,
     toolCallId,
     toolName: input.toolName ?? "subagent",
+    toolArgsSignature,
     delegationMode: input.delegationMode ?? result?.lineEvent?.originMode ?? undefined,
     projectAgentsDir: input.projectAgentsDir ?? result?.nestedDetails?.[0]?.projectAgentsDir ?? null,
     result,
@@ -423,6 +438,7 @@ function serializeNode(node: SubagentTreeNode): unknown {
     previousTurnId: node.previousTurnId,
     isCurrent: node.isCurrent,
     recovered: node.recovered,
+    activeAgentName: node.activeAgentName,
     userMessagePreview: node.userMessagePreview,
     streamingText: node.streamingText,
     finalText: node.finalText,
@@ -430,6 +446,7 @@ function serializeNode(node: SubagentTreeNode): unknown {
     projectAgentsDir: node.projectAgentsDir,
     toolCallId: node.toolCallId,
     toolName: node.toolName,
+    toolArgsSignature: node.toolArgsSignature,
     result: node.result ? serializeResult(node.result) : undefined,
     children: node.children.map(serializeNode),
   };
@@ -491,21 +508,82 @@ function extractToolResultDetails(message: unknown): SubagentDetails | null {
   return parseSubagentDetails(message.details);
 }
 
-function parseSubagentResult(value: unknown): SingleResult | undefined {
+const MAX_SUBAGENT_RESULT_UNWRAP_DEPTH = 8;
+
+function parseSubagentResult(value: unknown, depth = 0, seen = new Set<object>()): SingleResult | undefined {
+  if (depth > MAX_SUBAGENT_RESULT_UNWRAP_DEPTH) return undefined;
   if (isSingleResult(value)) return value;
   if (!isObject(value)) return undefined;
-  const results = Array.isArray(value.results) ? value.results.filter(isSingleResult) : [];
-  return results[0];
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+
+  const directDetails = parseSubagentDetails(value);
+  if (directDetails?.results[0]) return directDetails.results[0];
+
+  const candidates: unknown[] = [];
+  if ("details" in value) candidates.push(value.details);
+  if ("result" in value) candidates.push(value.result);
+  if ("partialResult" in value) candidates.push(value.partialResult);
+  if ("content" in value) {
+    if (Array.isArray(value.content)) candidates.push(...value.content);
+    else candidates.push(value.content);
+  }
+  if (Array.isArray(value.results)) candidates.push(value.results[0]);
+
+  for (const candidate of candidates) {
+    const parsed = parseSubagentResult(candidate, depth + 1, seen);
+    if (parsed) return parsed;
+  }
+
+  return undefined;
 }
 
-function findChildByToolCallId(node: SubagentTreeNode, toolCallId?: string): SubagentTreeNode | undefined {
+function findSubagentNodeByToolCallId(node: SubagentTreeNode, toolCallId?: string): SubagentTreeNode | undefined {
   if (!toolCallId) return undefined;
-  return node.children.find((child) => child.toolCallId === toolCallId);
+  for (const child of node.children) {
+    const childIdMatches = child.id === toolCallId || child.id.endsWith(`:${toolCallId}`) || child.id.endsWith(`/subagent-${toolCallId}`);
+    const resultIdMatches = child.result?.toolCallId === toolCallId || child.result?.childLeafId === toolCallId || child.result?.lineEvent?.lineId === toolCallId;
+    if (child.toolCallId === toolCallId || childIdMatches || resultIdMatches) return child;
+    const nested = findSubagentNodeByToolCallId(child, toolCallId);
+    if (nested) return nested;
+  }
+  return undefined;
 }
 
 function findChildById(node: SubagentTreeNode, id?: string): SubagentTreeNode | undefined {
   if (!id) return undefined;
   return node.children.find((child) => child.id === id);
+}
+
+function findSubagentNodeByInputSignature(
+  turn: SubagentTreeNode,
+  input: ActivityStoreSubagentInput,
+  toolCallId?: string,
+): SubagentTreeNode | undefined {
+  if (toolCallId) return findSubagentNodeByToolCallId(turn, toolCallId);
+  if (!input.toolName) return undefined;
+  const toolArgsSignature = input.args ? stableStringify(input.args) : undefined;
+  return turn.children.find((child) => {
+    if (child.toolName !== input.toolName) return false;
+    if (toolArgsSignature && child.toolArgsSignature === toolArgsSignature) return true;
+    return child.status === (input.status ?? child.status) && (!child.toolCallId || child.toolCallId === toolCallId);
+  });
+}
+
+function findSubagentNodeBySemanticInput(turn: SubagentTreeNode, input: ActivityStoreSubagentInput): SubagentTreeNode | undefined {
+  const toolArgsSignature = input.args ? stableStringify(input.args) : undefined;
+  const visit = (node: SubagentTreeNode): SubagentTreeNode | undefined => {
+    for (const child of node.children) {
+      if (input.toolName && child.toolName === input.toolName) {
+        if (toolArgsSignature && child.toolArgsSignature === toolArgsSignature) return child;
+        if (!toolArgsSignature && !input.toolCallId && child.status === (input.status ?? child.status)) return child;
+      }
+      const nested = visit(child);
+      if (nested) return nested;
+    }
+    return undefined;
+  };
+  return visit(turn);
 }
 
 function recomputeSessionStatus(root: SubagentTreeNode): void {
@@ -530,6 +608,27 @@ function computeAggregateStatus(nodes: Array<SubagentTreeNode | SingleResult>): 
   return unique.size === 1 ? statuses[0] ?? "success" : "mixed";
 }
 
+function settleDescendantStatuses(node: SubagentTreeNode, terminalStatus: SubagentNodeStatus): void {
+  for (const child of node.children) {
+    if (isActiveStatus(child.status)) {
+      child.status = mergeStatus(child.status, terminalStatus);
+    }
+    if (child.children.length > 0) {
+      settleDescendantStatuses(child, terminalStatus);
+    }
+  }
+}
+
+function constrainNodeToTerminalParent(parent: SubagentTreeNode, node: SubagentTreeNode): void {
+  if (!isTerminalStatus(parent.status) || !isActiveStatus(node.status)) return;
+  node.status = mergeStatus(node.status, parent.status);
+}
+
+function settleTurnChildren(turn: SubagentTreeNode): void {
+  if (!isTerminalStatus(turn.status)) return;
+  settleDescendantStatuses(turn, turn.status);
+}
+
 function updateTurnContent(node: SubagentTreeNode, message: unknown): void {
   const assistantText = extractAssistantText(message);
   if (assistantText) {
@@ -551,7 +650,7 @@ function updateSubagentFromToolCall(
   node.toolName = toolCall.name;
   const args = toolCall.arguments;
   const agentName = typeof args.agent === "string" && args.agent.trim() ? args.agent.trim() : undefined;
-  if (agentName) node.label = agentName;
+  if (agentName && (!node.label || node.label === node.toolName || node.label.startsWith(`${node.toolName ?? "subagent"} `) || node.label === node.toolCallId)) node.label = agentName;
   const mode = typeof args.mode === "string" ? args.mode : undefined;
   if (mode === "spawn" || mode === "fork" || mode === "continue") node.delegationMode = mode;
 }
@@ -560,29 +659,73 @@ function mergeSubagentResult(node: SubagentTreeNode, details: SubagentDetails, i
   const result = details.results[0];
   if (result) {
     node.result = result;
-    node.label = result.agent || node.label;
+    if (!node.label || node.label === node.toolName || node.label.startsWith(`${node.toolName ?? "subagent"} `)) {
+      node.label = result.agent || node.label;
+    }
     node.delegationMode = details.delegationMode;
     node.projectAgentsDir = details.projectAgentsDir;
     node.status = mergeStatus(node.status, computeResultStatus(result));
     if (result.nestedDetails && result.nestedDetails.length > 0) {
-      node.children = result.nestedDetails.flatMap((nested, index) => {
+      const seenToolCallIds = new Set<string>();
+      for (const [index, nested] of result.nestedDetails.entries()) {
         const nestedResult = nested.results[0];
-        if (!nestedResult) return [];
-        const nestedNode = createSubagentNode(node.sessionId ?? null, node.id, {
-          toolCallId: nestedResult.childLeafId ?? `${node.toolCallId ?? node.id}:${index}`,
+        if (!nestedResult) continue;
+        const nestedToolCallId = nestedResult.toolCallId ?? nestedResult.childLeafId ?? nestedResult.lineEvent?.lineId ?? `${node.toolCallId ?? node.id}:${index}`;
+        if (seenToolCallIds.has(nestedToolCallId)) continue;
+        seenToolCallIds.add(nestedToolCallId);
+        const nestedNode = upsertSubagentNode(node, {
+          toolCallId: nestedToolCallId,
           toolName: "subagent",
           result: nestedResult,
           delegationMode: nested.delegationMode,
           projectAgentsDir: nested.projectAgentsDir,
           status: computeResultStatus(nestedResult),
-        }, index + 1);
+        }, node.children.length + index + 1);
         mergeSubagentResult(nestedNode, nested, false, getResultSummaryText(nestedResult));
-        return [nestedNode];
-      });
+      }
     }
   }
   if (isError) node.status = mergeStatus(node.status, "error");
   if (resultText) node.finalText = resultText;
+}
+
+function normalizeSubagentNodeFromInput(node: SubagentTreeNode, input: ActivityStoreSubagentInput, toolCallId?: string): void {
+  if (input.toolName) node.toolName = input.toolName;
+  if (toolCallId) node.toolCallId = toolCallId;
+  node.toolArgsSignature = input.args ? stableStringify(input.args) : node.toolArgsSignature;
+  if (input.delegationMode) node.delegationMode = input.delegationMode;
+  if (input.projectAgentsDir !== undefined) node.projectAgentsDir = input.projectAgentsDir;
+  if (input.args && isObject(input.args) && input.toolName) {
+    updateSubagentFromToolCall(node, {
+      id: toolCallId,
+      name: input.toolName,
+      arguments: input.args,
+    });
+  }
+  const parsedResult = parseSubagentResult(input.result);
+  if (parsedResult) {
+    node.result = parsedResult;
+    node.label = parsedResult.agent || node.label;
+    node.status = mergeStatus(node.status, computeResultStatus(parsedResult));
+    if (parsedResult.nestedDetails && parsedResult.nestedDetails.length > 0) {
+      for (const [index, nested] of parsedResult.nestedDetails.entries()) {
+        const nestedResult = nested.results[0];
+        if (!nestedResult) continue;
+        const nestedToolCallId = nestedResult.toolCallId ?? nestedResult.childLeafId ?? nestedResult.lineEvent?.lineId ?? `${node.toolCallId ?? node.id}:${index}`;
+        const nestedNode = upsertSubagentNode(node, {
+          toolCallId: nestedToolCallId,
+          toolName: "subagent",
+          result: nestedResult,
+          delegationMode: nested.delegationMode,
+          projectAgentsDir: nested.projectAgentsDir,
+          status: computeResultStatus(nestedResult),
+        }, node.children.length + index + 1);
+        mergeSubagentResult(nestedNode, nested, false, getResultSummaryText(nestedResult));
+      }
+    }
+  }
+  if (typeof input.status === "string") node.status = mergeStatus(node.status, input.status);
+  if (input.isError) node.status = mergeStatus(node.status, "error");
 }
 
 function upsertSubagentNode(
@@ -591,60 +734,20 @@ function upsertSubagentNode(
   orderKey: number,
 ): SubagentTreeNode {
   const toolCallId = typeof input.toolCallId === "string" && input.toolCallId.trim() ? input.toolCallId.trim() : undefined;
-  let node = findChildByToolCallId(turn, toolCallId);
-  if (!node && typeof input.parentTurnId === "string") {
-    node = findChildById(turn, input.parentTurnId);
+  let node = findSubagentNodeByToolCallId(turn, toolCallId);
+  if (!node) {
+    node = findSubagentNodeByInputSignature(turn, input, toolCallId);
   }
   if (!node) {
     node = createSubagentNode(turn.sessionId ?? null, turn.id, input, orderKey);
     turn.children.push(node);
   }
+
   node.parentId = turn.id;
   node.orderKey = node.orderKey ?? orderKey;
   node.sessionId = turn.sessionId ?? null;
-  node.status = mergeStatus(node.status, input.status ?? node.status);
-  if (input.toolName) node.toolName = input.toolName;
-  if (toolCallId) node.toolCallId = toolCallId;
-  if (input.delegationMode) node.delegationMode = input.delegationMode;
-  if (input.projectAgentsDir !== undefined) node.projectAgentsDir = input.projectAgentsDir;
-
-  if (input.args && isObject(input.args) && input.toolName) {
-    updateSubagentFromToolCall(node, {
-      id: toolCallId,
-      name: input.toolName,
-      arguments: input.args,
-    });
-  }
-
-  const parsedResult = parseSubagentResult(input.result);
-  if (parsedResult) {
-    node.result = parsedResult;
-    node.label = parsedResult.agent || node.label;
-    node.status = mergeStatus(node.status, computeResultStatus(parsedResult));
-    if (parsedResult.nestedDetails && parsedResult.nestedDetails.length > 0) {
-      node.children = parsedResult.nestedDetails.flatMap((nested, index) => {
-        const nestedResult = nested.results[0];
-        if (!nestedResult) return [];
-        const nestedNode = createSubagentNode(node.sessionId ?? null, node.id, {
-          toolCallId: nestedResult.childLeafId ?? `${node.toolCallId ?? node.id}:${index}`,
-          toolName: "subagent",
-          result: nestedResult,
-          delegationMode: nested.delegationMode,
-          projectAgentsDir: nested.projectAgentsDir,
-          status: computeResultStatus(nestedResult),
-        }, index + 1);
-        if (nestedResult) {
-          nestedNode.result = nestedResult;
-          nestedNode.label = nestedResult.agent || nestedNode.label;
-          nestedNode.status = computeResultStatus(nestedResult);
-        }
-        return [nestedNode];
-      });
-    }
-  }
-
-  if (typeof input.status === "string") node.status = mergeStatus(node.status, input.status);
-  if (input.isError) node.status = mergeStatus(node.status, "error");
+  normalizeSubagentNodeFromInput(node, input, toolCallId);
+  constrainNodeToTerminalParent(turn, node);
   return node;
 }
 
@@ -653,6 +756,21 @@ function setCurrentTurn(root: SubagentTreeNode, turn: SubagentTreeNode | undefin
     child.isCurrent = false;
   }
   if (turn) turn.isCurrent = true;
+}
+
+function closeTurn(turn: SubagentTreeNode | undefined): void {
+  if (!turn) return;
+  if (turn.status === "pending") {
+    turn.status = turn.children.some((child) => child.status === "running" || child.status === "streaming") ? "running" : "success";
+  } else if ((turn.status === "running" || turn.status === "streaming") && turn.children.every((child) => isTerminalStatus(child.status))) {
+    turn.status = computeAggregateStatus(turn.children);
+  } else if (turn.status === "running" && turn.children.length === 0) {
+    turn.status = "success";
+  }
+  if (isTerminalStatus(turn.status)) {
+    settleTurnChildren(turn);
+  }
+  turn.isCurrent = false;
 }
 
 class ActivityTreeStoreImpl implements ActivityStore {
@@ -664,9 +782,9 @@ class ActivityTreeStoreImpl implements ActivityStore {
   private subscribers = new Set<ActivityStoreSubscriber>();
   private signature = getSubagentTreeSignature(this.root);
 
-  private emitIfChanged(): void {
+  private emitChange(force = false): void {
     const nextSignature = getSubagentTreeSignature(this.root);
-    if (nextSignature === this.signature) return;
+    if (!force && nextSignature === this.signature) return;
     this.signature = nextSignature;
     for (const subscriber of this.subscribers) subscriber();
   }
@@ -683,8 +801,12 @@ class ActivityTreeStoreImpl implements ActivityStore {
   }
 
   reset(sessionId?: string | null): void {
-    this.ensureRoot(sessionId ?? null);
-    this.emitIfChanged();
+    this.currentSessionId = sessionId ?? null;
+    this.root = createSessionNode(this.currentSessionId);
+    this.currentTurn = undefined;
+    this.turnSequence = 0;
+    this.pendingUserText = undefined;
+    this.emitChange(true);
   }
 
   reconcileBranch(branch: unknown[], header?: unknown): void {
@@ -707,6 +829,8 @@ class ActivityTreeStoreImpl implements ActivityStore {
       if (!isObject(message)) continue;
 
       if (message.role === "user") {
+        closeTurn(this.currentTurn);
+        this.currentTurn = undefined;
         this.pendingUserText = extractUserText(message) || this.pendingUserText;
         this.beginActiveAgentTurn({
           forceNew: true,
@@ -757,20 +881,17 @@ class ActivityTreeStoreImpl implements ActivityStore {
           toolName: message.toolName,
           result: details ?? message.details,
           isError: message.isError === true,
-          status: message.isError === true ? "error" : undefined,
+          status: message.isError === true ? "error" : "success",
         }, turn.children.length + 1);
         if (details) mergeSubagentResult(child, details, message.isError === true, Array.isArray(message.content) ? message.content.map((part: unknown) => (isObject(part) && part.type === "text" && typeof part.text === "string" ? part.text : "")).filter(Boolean).join("\n") : undefined);
         else if (message.isError === true) child.status = mergeStatus(child.status, "error");
       }
     }
 
-    if (this.currentTurn) {
-      this.currentTurn.isCurrent = true;
-      if (this.currentTurn.status === "pending") this.currentTurn.status = "running";
-    }
+    closeTurn(this.currentTurn);
+    this.currentTurn = undefined;
     recomputeSessionStatus(this.root);
-    this.signature = getSubagentTreeSignature(this.root);
-    this.emitIfChanged();
+    this.emitChange();
   }
 
   noteUserInput(text: unknown, _timestamp?: number): void {
@@ -783,14 +904,16 @@ class ActivityTreeStoreImpl implements ActivityStore {
   beginActiveAgentTurn(input: ActivityStoreTurnInput = {}): SubagentTreeNode {
     if (!input.forceNew && this.currentTurn && this.currentTurn.isCurrent && !isTerminalStatus(this.currentTurn.status)) {
       if (input.turnIndex !== undefined) this.currentTurn.turnIndex = input.turnIndex;
-      if (input.userMessagePreview) {
-        this.currentTurn.userMessagePreview = input.userMessagePreview;
-        this.currentTurn.label = `${this.currentTurn.recovered ? "Recovered turn" : "Turn"} #${this.currentTurn.turnIndex ?? this.currentTurn.orderKey ?? 0} · ${input.userMessagePreview}`;
-      }
+      if (input.userMessagePreview !== undefined) this.currentTurn.userMessagePreview = input.userMessagePreview;
       if (input.streamingText !== undefined) this.currentTurn.streamingText = input.streamingText;
       if (input.finalText !== undefined) this.currentTurn.finalText = input.finalText;
       if (input.status) this.currentTurn.status = mergeStatus(this.currentTurn.status, input.status);
       if (input.recovered !== undefined) this.currentTurn.recovered = input.recovered;
+      const hadActiveAgentName = this.currentTurn.activeAgentName !== undefined;
+      if (input.activeAgentName !== undefined && !hadActiveAgentName) this.currentTurn.activeAgentName = input.activeAgentName;
+      if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+        this.currentTurn.label = refreshTurnLabel(this.currentTurn);
+      }
       return this.currentTurn;
     }
 
@@ -802,14 +925,14 @@ class ActivityTreeStoreImpl implements ActivityStore {
       isCurrent: input.isCurrent ?? true,
     }, previousTurnId, orderKey);
     if (input.turnIndex === undefined) turn.turnIndex = orderKey;
-    turn.label = input.userMessagePreview ?? this.pendingUserText ? `${turn.recovered ? "Recovered turn" : "Turn"} #${turn.turnIndex ?? orderKey} · ${input.userMessagePreview ?? this.pendingUserText}` : `${turn.recovered ? "Recovered turn" : "Turn"} #${turn.turnIndex ?? orderKey}`;
+    turn.label = input.userMessagePreview ?? this.pendingUserText ? `${createTurnLabel(turn)} · ${input.userMessagePreview ?? this.pendingUserText}` : createTurnLabel(turn);
     turn.parentId = this.root.id;
     this.root.children.push(turn);
     this.currentTurn = turn;
     this.pendingUserText = undefined;
     setCurrentTurn(this.root, turn);
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return turn;
   }
 
@@ -817,17 +940,19 @@ class ActivityTreeStoreImpl implements ActivityStore {
     const turn = this.findTurn(input.id ?? input.turnId, input.turnIndex);
     if (!turn) return undefined;
     if (input.turnIndex !== undefined) turn.turnIndex = input.turnIndex;
-    if (input.userMessagePreview) {
-      turn.userMessagePreview = input.userMessagePreview;
-      turn.label = `${turn.recovered ? "Recovered turn" : "Turn"} #${turn.turnIndex ?? turn.orderKey ?? 0} · ${input.userMessagePreview}`;
-    }
+    if (input.userMessagePreview !== undefined) turn.userMessagePreview = input.userMessagePreview;
+    const hadActiveAgentName = turn.activeAgentName !== undefined;
+    if (input.activeAgentName !== undefined && !hadActiveAgentName) turn.activeAgentName = input.activeAgentName;
     if (input.streamingText !== undefined) turn.streamingText = input.streamingText;
     if (input.finalText !== undefined) turn.finalText = input.finalText;
     if (input.status) turn.status = mergeStatus(turn.status, input.status);
     if (input.recovered !== undefined) turn.recovered = input.recovered;
     if (input.isCurrent !== undefined) turn.isCurrent = input.isCurrent;
+    if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+      turn.label = refreshTurnLabel(turn);
+    }
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return turn;
   }
 
@@ -838,12 +963,20 @@ class ActivityTreeStoreImpl implements ActivityStore {
     turn.status = mergeStatus(turn.status, nextStatus);
     turn.isCurrent = false;
     if (input.turnIndex !== undefined) turn.turnIndex = input.turnIndex;
-    if (input.userMessagePreview) turn.userMessagePreview = input.userMessagePreview;
+    if (input.userMessagePreview !== undefined) turn.userMessagePreview = input.userMessagePreview;
+    const hadActiveAgentName = turn.activeAgentName !== undefined;
+    if (input.activeAgentName !== undefined && !hadActiveAgentName) turn.activeAgentName = input.activeAgentName;
     if (input.streamingText !== undefined) turn.streamingText = input.streamingText;
     if (input.finalText !== undefined) turn.finalText = input.finalText;
+    if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+      turn.label = refreshTurnLabel(turn);
+    }
+    if (isTerminalStatus(turn.status)) {
+      settleTurnChildren(turn);
+    }
     this.currentTurn = undefined;
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return turn;
   }
 
@@ -855,15 +988,25 @@ class ActivityTreeStoreImpl implements ActivityStore {
       status: input.status ?? "running",
     }, turn.children.length + 1);
     child.status = mergeStatus(child.status, input.status ?? "running");
-    turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
+    if (!isTerminalStatus(turn.status)) {
+      turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
+    }
+    if (isTerminalStatus(turn.status)) {
+      settleTurnChildren(turn);
+    }
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return child;
   }
 
   updateSubagentTool(input: ActivityStoreSubagentInput & { id?: string } = {}): SubagentTreeNode | undefined {
-    const child = this.findSubagent(input.id ?? input.toolCallId);
+    const scopeTurn = input.parentTurnId ? this.findTurn(input.parentTurnId) : this.currentTurn;
+    let child = this.findSubagent(input.id ?? input.toolCallId);
+    if (!child && !input.id && !input.toolCallId && scopeTurn) {
+      child = findSubagentNodeBySemanticInput(scopeTurn, input);
+    }
     if (!child) return input.toolCallId ? this.startSubagentTool(input) : undefined;
+    const turn = this.findParentTurn(child.parentId);
     if (input.toolName) child.toolName = input.toolName;
     if (input.status) child.status = mergeStatus(child.status, input.status);
     if (input.args && isObject(input.args) && input.toolName) {
@@ -876,28 +1019,42 @@ class ActivityTreeStoreImpl implements ActivityStore {
     const parsedResult = parseSubagentResult(input.result);
     if (parsedResult) mergeSubagentResult(child, { mode: "single", delegationMode: input.delegationMode ?? child.delegationMode ?? "spawn", projectAgentsDir: input.projectAgentsDir ?? null, results: [parsedResult] }, input.isError === true);
     if (input.isError) child.status = mergeStatus(child.status, "error");
-    const turn = this.findParentTurn(child.parentId);
-    if (turn && !isTerminalStatus(child.status)) turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
+    if (turn) {
+      constrainNodeToTerminalParent(turn, child);
+      if (!isTerminalStatus(turn.status)) {
+        turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
+      } else {
+        settleTurnChildren(turn);
+      }
+    }
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return child;
   }
 
   endSubagentTool(input: ActivityStoreSubagentInput & { id?: string; status?: SubagentNodeStatus } = {}): SubagentTreeNode | undefined {
-    const child = this.findSubagent(input.id ?? input.toolCallId) ?? (input.toolCallId ? this.startSubagentTool(input) : undefined);
+    const scopeTurn = input.parentTurnId ? this.findTurn(input.parentTurnId) : this.currentTurn;
+    const child = this.findSubagent(input.id ?? input.toolCallId)
+      ?? (!input.id && !input.toolCallId && scopeTurn ? findSubagentNodeBySemanticInput(scopeTurn, input) : undefined)
+      ?? (input.toolCallId ? this.startSubagentTool(input) : undefined);
     if (!child) return undefined;
+    const turn = this.findParentTurn(child.parentId);
     const nextStatus = input.status ?? (input.isError ? "error" : child.status === "cancelled" ? "cancelled" : child.status === "error" ? "error" : "success");
     child.status = mergeStatus(child.status, nextStatus);
     const parsedResult = parseSubagentResult(input.result);
     if (parsedResult) mergeSubagentResult(child, { mode: "single", delegationMode: input.delegationMode ?? child.delegationMode ?? "spawn", projectAgentsDir: input.projectAgentsDir ?? null, results: [parsedResult] }, input.isError === true);
     if (input.isError) child.status = mergeStatus(child.status, "error");
-    const turn = this.findParentTurn(child.parentId);
     if (turn) {
-      turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : child.status === "running" ? "running" : turn.status);
-      if (turn.status === "pending") turn.status = "running";
+      constrainNodeToTerminalParent(turn, child);
+      if (isTerminalStatus(turn.status)) {
+        settleTurnChildren(turn);
+      } else {
+        turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : child.status === "running" ? "running" : turn.status);
+        if (turn.status === "pending") turn.status = "running";
+      }
     }
     recomputeSessionStatus(this.root);
-    this.emitIfChanged();
+    this.emitChange();
     return child;
   }
 
@@ -943,7 +1100,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
   private findSubagent(id?: string): SubagentTreeNode | undefined {
     if (!id) return undefined;
     for (const turn of this.root.children) {
-      const found = turn.children.find((child) => child.id === id || child.toolCallId === id);
+      const found = findSubagentNodeByToolCallId(turn, id);
       if (found) return found;
     }
     return undefined;
@@ -1025,10 +1182,7 @@ export function buildActivityTreeFromBranch(branch: unknown[], sessionId?: strin
   let turnIndex = 0;
 
   const closeTurnIfNeeded = (turn: SubagentTreeNode | undefined): void => {
-    if (!turn) return;
-    if (turn.status === "pending") turn.status = turn.children.some((child) => child.status === "running" || child.status === "streaming") ? "running" : "success";
-    if (turn.status === "running" && turn.children.length === 0) turn.status = "success";
-    turn.isCurrent = false;
+    closeTurn(turn);
   };
 
   for (const entry of branch) {
@@ -1157,6 +1311,7 @@ function buildTurnDetailLines(node: SubagentTreeNode): string[] {
   if (node.previousTurnId) lines.push(`Previous turn: ${node.previousTurnId}`);
   lines.push(`Current: ${node.isCurrent ? "yes" : "no"}`);
   if (node.recovered) lines.push("Recovered: yes");
+  if (node.activeAgentName) lines.push(`Active agent: ${node.activeAgentName}`);
   if (node.userMessagePreview) lines.push(`User message: ${node.userMessagePreview}`);
   if (node.streamingText) lines.push(`Streaming: ${node.streamingText}`);
   if (node.finalText) lines.push(`Final text: ${node.finalText}`);

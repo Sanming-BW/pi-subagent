@@ -349,6 +349,13 @@ interface ActiveAgentRuntimeState {
   activeAgent?: AgentConfig;
 }
 
+const DEFAULT_ACTIVE_AGENT_DISPLAY_NAME = "Pi";
+
+function getActivityActiveAgentName(state: ActiveAgentRuntimeState): string {
+  const name = state.activeAgentName?.trim();
+  return name || DEFAULT_ACTIVE_AGENT_DISPLAY_NAME;
+}
+
 function updateActiveAgentStatus(ctx: ExtensionContext, activeAgent?: AgentConfig): void {
   const statusText = activeAgent ? ctx.ui.theme.fg("accent", `agent:${activeAgent.name}`) : undefined;
   ctx.ui.setStatus("active-agent", statusText);
@@ -684,7 +691,7 @@ export default function (pi: ExtensionAPI) {
     return parts.length > 0 ? parts.join("\n") : null;
   }
 
-  function syncStoreFromBranch(ctx: ExtensionContext): void {
+  function syncStoreFromBranch(ctx: { sessionManager: SubagentViewerContext["sessionManager"] }): void {
     try {
       const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> | undefined;
       if (!manager || typeof manager.getBranch !== "function") return;
@@ -700,7 +707,7 @@ export default function (pi: ExtensionAPI) {
     const turnIndex = event && typeof event === "object" && typeof (event as { turnIndex?: unknown }).turnIndex === "number"
       ? (event as { turnIndex: number }).turnIndex
       : undefined;
-    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true });
+    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState) });
   }
 
   function handleAssistantMessage(event: unknown): void {
@@ -710,6 +717,7 @@ export default function (pi: ExtensionAPI) {
       const text = getMessageText(message);
       activityStore.updateActiveAgentTurn({
         status: "streaming",
+        activeAgentName: getActivityActiveAgentName(activeAgentState),
         streamingText: text ?? undefined,
         finalText: text ?? undefined,
       });
@@ -746,6 +754,7 @@ export default function (pi: ExtensionAPI) {
   async function guardedOpenSubagentViewer(ctx: SubagentViewerContext): Promise<void> {
     if (!ctx.hasUI) return;
     if (viewerOpen) return;
+    syncStoreFromBranch(ctx);
     viewerOpen = true;
     try {
       await openSubagentViewer({ ...ctx, activityStore });
@@ -950,7 +959,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
-    activityStore.beginActiveAgentTurn({ status: "running", isCurrent: true });
+    activityStore.beginActiveAgentTurn({ status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState) });
     syncStoreFromBranch(ctx);
   });
 
@@ -958,7 +967,7 @@ export default function (pi: ExtensionAPI) {
     const turnIndex = typeof (event as { turnIndex?: unknown }).turnIndex === "number"
       ? (event as { turnIndex: number }).turnIndex
       : undefined;
-    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true });
+    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState) });
     syncStoreFromBranch(ctx);
   });
 
@@ -976,6 +985,7 @@ export default function (pi: ExtensionAPI) {
       : getMessageText(message) ?? current?.streamingText;
     activityStore.updateActiveAgentTurn({
       status: "streaming",
+      activeAgentName: getActivityActiveAgentName(activeAgentState),
       streamingText: nextText ?? undefined,
     });
   });
@@ -992,6 +1002,7 @@ export default function (pi: ExtensionAPI) {
     const text = getMessageText(message);
     activityStore.updateActiveAgentTurn({
       status: "streaming",
+      activeAgentName: getActivityActiveAgentName(activeAgentState),
       streamingText: text ?? undefined,
       finalText: text ?? undefined,
     });
@@ -1022,6 +1033,7 @@ export default function (pi: ExtensionAPI) {
     }
     activityStore.endActiveAgentTurn({
       status: "success",
+      activeAgentName: getActivityActiveAgentName(activeAgentState),
       turnIndex: typeof (event as { turnIndex?: unknown }).turnIndex === "number"
         ? (event as { turnIndex: number }).turnIndex
         : undefined,
@@ -1029,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, _ctx) => {
-    activityStore.endActiveAgentTurn({ status: "success" });
+    activityStore.endActiveAgentTurn({ status: "success", activeAgentName: getActivityActiveAgentName(activeAgentState) });
   });
 
   // Inject available agents into the system prompt, or replace it for active-agent mode.

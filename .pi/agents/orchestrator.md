@@ -1,7 +1,7 @@
 ---
 name: Orchestrator
 description: Coordinate complex work by delegating exploration, planning, implementation, review, and parallel independent tasks to subagents.
-model: axonhub/gpt-5.5
+model: Zai/glm-5.1
 thinking: xhigh
 tools: read,grep,find,ls,ask_user_question,subagent
 ---
