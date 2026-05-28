@@ -32,6 +32,7 @@ export interface SubagentTreeNode {
   parentId?: string | null;
   orderKey?: number;
   turnIndex?: number;
+  turnIndices?: number[];
   previousTurnId?: string | null;
   isCurrent?: boolean;
   recovered?: boolean;
@@ -112,6 +113,7 @@ export interface ActivityStore {
   noteUserInput(text: unknown, timestamp?: number): void;
   beginActiveAgentTurn(input?: ActivityStoreTurnInput): SubagentTreeNode;
   updateActiveAgentTurn(input?: ActivityStoreTurnInput & { id?: string; turnId?: string }): SubagentTreeNode | undefined;
+  finishActiveAgentModelTurn(input?: ActivityStoreTurnInput & { id?: string; turnId?: string }): SubagentTreeNode | undefined;
   endActiveAgentTurn(input?: ActivityStoreTurnInput & { id?: string; turnId?: string; status?: SubagentNodeStatus }): SubagentTreeNode | undefined;
   startSubagentTool(input?: ActivityStoreSubagentInput): SubagentTreeNode | undefined;
   updateSubagentTool(input?: ActivityStoreSubagentInput & { id?: string }): SubagentTreeNode | undefined;
@@ -322,20 +324,59 @@ function createLegacyAgentNode(
   return node;
 }
 
-function createTurnLabel(turn: Pick<SubagentTreeNode, "turnIndex" | "orderKey" | "recovered" | "activeAgentName">): string {
-  const index = turn.turnIndex ?? turn.orderKey ?? 0;
+function createTurnLabel(turn: Pick<SubagentTreeNode, "orderKey" | "recovered" | "activeAgentName">): string {
+  const index = turn.orderKey ?? 0;
   const prefix = turn.recovered ? "Recovered turn" : "Turn";
   const agent = typeof turn.activeAgentName === "string" && turn.activeAgentName.trim() ? ` · ${turn.activeAgentName.trim()}` : "";
   return `${prefix} #${index}${agent}`;
 }
 
-function refreshTurnLabel(turn: Pick<SubagentTreeNode, "turnIndex" | "orderKey" | "recovered" | "activeAgentName" | "userMessagePreview">): string {
+function refreshTurnLabel(turn: Pick<SubagentTreeNode, "orderKey" | "recovered" | "activeAgentName" | "userMessagePreview">): string {
   return `${createTurnLabel(turn)}${turn.userMessagePreview ? ` · ${turn.userMessagePreview}` : ""}`;
+}
+
+function normalizeActiveAgentName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeConcreteActiveAgentName(value: unknown): string | undefined {
+  const name = normalizeActiveAgentName(value);
+  if (!name || name === "Pi") return undefined;
+  return name;
+}
+
+function assignActiveAgentName(turn: Pick<SubagentTreeNode, "activeAgentName"> & { activeAgentName?: string }, nextValue: unknown): boolean {
+  const nextName = normalizeConcreteActiveAgentName(nextValue);
+  if (!nextName) return false;
+
+  const currentRaw = normalizeActiveAgentName(turn.activeAgentName);
+  const currentName = normalizeConcreteActiveAgentName(turn.activeAgentName);
+  if (currentName === nextName) return false;
+  if (!currentName || currentRaw === "Pi") {
+    turn.activeAgentName = nextName;
+    return true;
+  }
+  return false;
+}
+
+function recordTurnIndex(turn: Pick<SubagentTreeNode, "turnIndex" | "turnIndices"> & { turnIndices?: number[] }, turnIndex?: number): boolean {
+  if (!isNumber(turnIndex)) return false;
+  if (!turn.turnIndices) turn.turnIndices = [];
+  if (!turn.turnIndices.includes(turnIndex)) turn.turnIndices.push(turnIndex);
+  if (turn.turnIndex === undefined) turn.turnIndex = turnIndex;
+  return true;
+}
+
+function getTurnDisplayIndex(turn: Pick<SubagentTreeNode, "orderKey">): number {
+  return turn.orderKey ?? 0;
 }
 
 function createTurnNode(sessionId: string | null, input: ActivityStoreTurnInput = {}, previousTurnId?: string | null, orderKey = 0): SubagentTreeNode {
   const turnIndex = input.turnIndex ?? orderKey;
-  const baseLabel = createTurnLabel({ turnIndex, orderKey, recovered: input.recovered, activeAgentName: input.activeAgentName });
+  const activeAgentName = normalizeConcreteActiveAgentName(input.activeAgentName);
+  const baseLabel = createTurnLabel({ orderKey, recovered: input.recovered, activeAgentName });
   const node: SubagentTreeNode = {
     id: `turn-${orderKey}`,
     kind: "active-agent-turn",
@@ -345,10 +386,11 @@ function createTurnNode(sessionId: string | null, input: ActivityStoreTurnInput 
     parentId: sessionId ? `session:${sessionId}` : null,
     orderKey,
     turnIndex,
+    turnIndices: isNumber(turnIndex) ? [turnIndex] : [],
     previousTurnId,
     isCurrent: input.isCurrent ?? true,
     recovered: input.recovered ?? false,
-    activeAgentName: input.activeAgentName,
+    activeAgentName,
     userMessagePreview: input.userMessagePreview,
     streamingText: input.streamingText,
     finalText: input.finalText,
@@ -435,6 +477,7 @@ function serializeNode(node: SubagentTreeNode): unknown {
     parentId: node.parentId,
     orderKey: node.orderKey,
     turnIndex: node.turnIndex,
+    turnIndices: node.turnIndices,
     previousTurnId: node.previousTurnId,
     isCurrent: node.isCurrent,
     recovered: node.recovered,
@@ -508,6 +551,91 @@ function extractToolResultDetails(message: unknown): SubagentDetails | null {
   return parseSubagentDetails(message.details);
 }
 
+interface TurnMeta {
+  turnIndex: number;
+  activeAgentName?: string;
+  phase?: string;
+  version?: number;
+}
+
+function extractTurnMetaMap(branch: unknown[]): Map<number, TurnMeta> {
+  const metaMap = new Map<number, TurnMeta>();
+  for (const entry of branch) {
+    if (!isObject(entry) || entry.type !== "custom") continue;
+    if (entry.customType !== "pi-subagent-turn-meta") continue;
+    const data = entry.data;
+    if (!isObject(data)) continue;
+    const turnIndex = typeof data.turnIndex === "number" && Number.isFinite(data.turnIndex) ? data.turnIndex : undefined;
+    if (turnIndex === undefined) continue;
+    const activeAgentName = normalizeConcreteActiveAgentName(data.activeAgentName);
+    const phase = typeof data.phase === "string" && data.phase.trim() ? data.phase.trim() : undefined;
+    const version = typeof data.version === "number" && Number.isFinite(data.version) ? data.version : undefined;
+    const existing = metaMap.get(turnIndex);
+    if (!existing || activeAgentName || phase || version !== undefined) {
+      metaMap.set(turnIndex, {
+        turnIndex,
+        activeAgentName: activeAgentName ?? existing?.activeAgentName,
+        phase: phase ?? existing?.phase,
+        version: version ?? existing?.version,
+      });
+    }
+  }
+  return metaMap;
+}
+
+function applyTurnMeta(turn: SubagentTreeNode, turnMetaMap: Map<number, TurnMeta>): void {
+  const meta = turnMetaMap.get(turn.turnIndex ?? turn.orderKey ?? 0);
+  if (!meta) return;
+  recordTurnIndex(turn, meta.turnIndex);
+  if (assignActiveAgentName(turn, meta.activeAgentName)) {
+    // label refreshed below
+  }
+  turn.label = refreshTurnLabel(turn);
+}
+
+function applyTurnMetaEntry(turn: SubagentTreeNode, meta: TurnMeta): void {
+  recordTurnIndex(turn, meta.turnIndex);
+  if (assignActiveAgentName(turn, meta.activeAgentName)) {
+    // label refreshed below
+  }
+  turn.label = refreshTurnLabel(turn);
+}
+
+function insertTurnInOrder(root: SubagentTreeNode, turn: SubagentTreeNode): void {
+  const index = turn.orderKey ?? root.children.length + 1;
+  const insertAt = root.children.findIndex((child) => (child.orderKey ?? 0) > index);
+  const previousTurnId = insertAt > 0 ? root.children[insertAt - 1]?.id ?? null : null;
+  turn.previousTurnId = previousTurnId;
+  turn.parentId = root.id;
+  if (insertAt < 0) root.children.push(turn);
+  else root.children.splice(insertAt, 0, turn);
+}
+
+function recoverMissingTurns(root: SubagentTreeNode, turnMetaMap: Map<number, TurnMeta>, sessionId: string | null): void {
+  if (turnMetaMap.size === 0) return;
+  const existingTurnIndices = new Set<number>();
+  for (const turn of root.children) {
+    if (turn.turnIndex !== undefined) existingTurnIndices.add(turn.turnIndex);
+    if (turn.turnIndices) {
+      for (const index of turn.turnIndices) existingTurnIndices.add(index);
+    }
+  }
+  const missing = Array.from(turnMetaMap.values()).filter((meta) => !existingTurnIndices.has(meta.turnIndex)).sort((a, b) => a.turnIndex - b.turnIndex);
+  for (const meta of missing) {
+    const orderKey = root.children.length + 1;
+    const turn = createTurnNode(sessionId, {
+      turnIndex: meta.turnIndex,
+      activeAgentName: meta.activeAgentName,
+      recovered: true,
+      isCurrent: false,
+      status: "success",
+    }, root.children.length > 0 ? root.children[root.children.length - 1].id : null, orderKey);
+    turn.parentId = root.id;
+    turn.label = refreshTurnLabel(turn);
+    insertTurnInOrder(root, turn);
+  }
+}
+
 const MAX_SUBAGENT_RESULT_UNWRAP_DEPTH = 8;
 
 function parseSubagentResult(value: unknown, depth = 0, seen = new Set<object>()): SingleResult | undefined {
@@ -570,20 +698,14 @@ function findSubagentNodeByInputSignature(
   });
 }
 
-function findSubagentNodeBySemanticInput(turn: SubagentTreeNode, input: ActivityStoreSubagentInput): SubagentTreeNode | undefined {
+function findDirectSubagentNodeBySemanticInput(parent: SubagentTreeNode, input: ActivityStoreSubagentInput): SubagentTreeNode | undefined {
   const toolArgsSignature = input.args ? stableStringify(input.args) : undefined;
-  const visit = (node: SubagentTreeNode): SubagentTreeNode | undefined => {
-    for (const child of node.children) {
-      if (input.toolName && child.toolName === input.toolName) {
-        if (toolArgsSignature && child.toolArgsSignature === toolArgsSignature) return child;
-        if (!toolArgsSignature && !input.toolCallId && child.status === (input.status ?? child.status)) return child;
-      }
-      const nested = visit(child);
-      if (nested) return nested;
-    }
-    return undefined;
-  };
-  return visit(turn);
+  return parent.children.find((child) => {
+    if (input.toolName && child.toolName !== input.toolName) return false;
+    if (toolArgsSignature) return child.toolArgsSignature === toolArgsSignature && isActiveStatus(child.status);
+    if (!input.toolCallId) return isActiveStatus(child.status);
+    return false;
+  });
 }
 
 function recomputeSessionStatus(root: SubagentTreeNode): void {
@@ -615,6 +737,27 @@ function settleDescendantStatuses(node: SubagentTreeNode, terminalStatus: Subage
     }
     if (child.children.length > 0) {
       settleDescendantStatuses(child, terminalStatus);
+    }
+  }
+}
+
+function settleSubtreeToTerminalStatus(node: SubagentTreeNode, terminalStatus: SubagentNodeStatus): void {
+  node.status = mergeStatus(node.status, terminalStatus);
+  settleDescendantStatuses(node, terminalStatus);
+}
+
+function isDescendantNode(root: SubagentTreeNode, maybeDescendant: SubagentTreeNode): boolean {
+  if (root === maybeDescendant) return true;
+  for (const child of root.children) {
+    if (isDescendantNode(child, maybeDescendant)) return true;
+  }
+  return false;
+}
+
+function removeActiveStackEntriesForNode(stack: SubagentTreeNode[], node: SubagentTreeNode): void {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (isDescendantNode(node, stack[i]!)) {
+      stack.splice(i, 1);
     }
   }
 }
@@ -764,7 +907,7 @@ function closeTurn(turn: SubagentTreeNode | undefined): void {
     turn.status = turn.children.some((child) => child.status === "running" || child.status === "streaming") ? "running" : "success";
   } else if ((turn.status === "running" || turn.status === "streaming") && turn.children.every((child) => isTerminalStatus(child.status))) {
     turn.status = computeAggregateStatus(turn.children);
-  } else if (turn.status === "running" && turn.children.length === 0) {
+  } else if ((turn.status === "running" || turn.status === "streaming") && turn.children.length === 0) {
     turn.status = "success";
   }
   if (isTerminalStatus(turn.status)) {
@@ -777,6 +920,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
   private root: SubagentTreeNode = createSessionNode(null);
   private currentSessionId: string | null = null;
   private currentTurn: SubagentTreeNode | undefined;
+  private activeSubagentStack: SubagentTreeNode[] = [];
   private turnSequence = 0;
   private pendingUserText: string | undefined;
   private subscribers = new Set<ActivityStoreSubscriber>();
@@ -795,6 +939,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
     this.currentSessionId = normalized;
     this.root = createSessionNode(normalized);
     this.currentTurn = undefined;
+    this.activeSubagentStack = [];
     this.turnSequence = 0;
     this.pendingUserText = undefined;
     this.signature = getSubagentTreeSignature(this.root);
@@ -804,6 +949,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
     this.currentSessionId = sessionId ?? null;
     this.root = createSessionNode(this.currentSessionId);
     this.currentTurn = undefined;
+    this.activeSubagentStack = [];
     this.turnSequence = 0;
     this.pendingUserText = undefined;
     this.emitChange(true);
@@ -819,11 +965,26 @@ class ActivityTreeStoreImpl implements ActivityStore {
 
     this.root.children = [];
     this.currentTurn = undefined;
-    this.turnSequence = 0;
+    this.activeSubagentStack = [];
     this.pendingUserText = undefined;
 
+    let turnMetaMap = extractTurnMetaMap(branch);
     const getTurn = () => this.currentTurn;
     for (const entry of branch) {
+      if (isObject(entry) && entry.type === "custom" && entry.customType === "pi-subagent-turn-meta") {
+        const data = isObject(entry.data) ? entry.data : undefined;
+        const turnIndex = data && typeof data.turnIndex === "number" && Number.isFinite(data.turnIndex) ? data.turnIndex : undefined;
+        if (turnIndex !== undefined && this.currentTurn) {
+          applyTurnMetaEntry(this.currentTurn, {
+            turnIndex,
+            activeAgentName: normalizeConcreteActiveAgentName(data.activeAgentName),
+            phase: typeof data.phase === "string" && data.phase.trim() ? data.phase.trim() : undefined,
+            version: typeof data.version === "number" && Number.isFinite(data.version) ? data.version : undefined,
+          });
+          turnMetaMap.delete(turnIndex);
+        }
+        continue;
+      }
       if (!isObject(entry) || entry.type !== "message") continue;
       const message = entry.message;
       if (!isObject(message)) continue;
@@ -841,6 +1002,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
           isCurrent: false,
         });
         updateTurnContent(getTurn()!, message);
+        applyTurnMeta(getTurn()!, turnMetaMap);
         continue;
       }
 
@@ -854,18 +1016,18 @@ class ActivityTreeStoreImpl implements ActivityStore {
           });
         }
         const turn = this.currentTurn!;
+        applyTurnMeta(turn, turnMetaMap);
         turn.status = mergeStatus(turn.status, message.stopReason === "aborted" ? "cancelled" : message.stopReason === "error" ? "error" : "running");
         updateTurnContent(turn, message);
         const calls = parseToolCallBlocks(message);
         for (const call of calls) {
           if (call.name !== "subagent") continue;
-          const child = upsertSubagentNode(turn, {
+          upsertSubagentNode(turn, {
             toolCallId: call.id,
             toolName: call.name,
             args: call.arguments,
             status: "running",
           }, turn.children.length + 1);
-          child.status = mergeStatus(child.status, "running");
         }
         continue;
       }
@@ -875,6 +1037,7 @@ class ActivityTreeStoreImpl implements ActivityStore {
           this.beginActiveAgentTurn({ recovered: true, status: "running", isCurrent: false });
         }
         const turn = this.currentTurn!;
+        applyTurnMeta(turn, turnMetaMap);
         const details = extractToolResultDetails(message);
         const child = upsertSubagentNode(turn, {
           toolCallId: typeof message.toolCallId === "string" ? message.toolCallId : undefined,
@@ -890,6 +1053,8 @@ class ActivityTreeStoreImpl implements ActivityStore {
 
     closeTurn(this.currentTurn);
     this.currentTurn = undefined;
+    recoverMissingTurns(this.root, turnMetaMap, this.currentSessionId);
+    this.turnSequence = this.root.children.reduce((max, child) => Math.max(max, child.orderKey ?? 0), 0);
     recomputeSessionStatus(this.root);
     this.emitChange();
   }
@@ -902,29 +1067,30 @@ class ActivityTreeStoreImpl implements ActivityStore {
   }
 
   beginActiveAgentTurn(input: ActivityStoreTurnInput = {}): SubagentTreeNode {
-    if (!input.forceNew && this.currentTurn && this.currentTurn.isCurrent && !isTerminalStatus(this.currentTurn.status)) {
-      if (input.turnIndex !== undefined) this.currentTurn.turnIndex = input.turnIndex;
+    if (!input.forceNew && this.currentTurn && !isTerminalStatus(this.currentTurn.status)) {
+      recordTurnIndex(this.currentTurn, input.turnIndex);
       if (input.userMessagePreview !== undefined) this.currentTurn.userMessagePreview = input.userMessagePreview;
       if (input.streamingText !== undefined) this.currentTurn.streamingText = input.streamingText;
       if (input.finalText !== undefined) this.currentTurn.finalText = input.finalText;
       if (input.status) this.currentTurn.status = mergeStatus(this.currentTurn.status, input.status);
       if (input.recovered !== undefined) this.currentTurn.recovered = input.recovered;
-      const hadActiveAgentName = this.currentTurn.activeAgentName !== undefined;
-      if (input.activeAgentName !== undefined && !hadActiveAgentName) this.currentTurn.activeAgentName = input.activeAgentName;
-      if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+      const hadActiveAgentName = normalizeActiveAgentName(this.currentTurn.activeAgentName);
+      const activeAgentChanged = assignActiveAgentName(this.currentTurn, input.activeAgentName);
+      if (input.userMessagePreview !== undefined || activeAgentChanged || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
         this.currentTurn.label = refreshTurnLabel(this.currentTurn);
       }
       return this.currentTurn;
     }
 
     const previousTurnId = this.root.children.length > 0 ? this.root.children[this.root.children.length - 1].id : null;
-    const orderKey = ++this.turnSequence || this.root.children.length + 1;
+    const orderKey = ++this.turnSequence;
     const turn = createTurnNode(this.currentSessionId, {
       ...input,
       userMessagePreview: input.userMessagePreview ?? this.pendingUserText,
       isCurrent: input.isCurrent ?? true,
     }, previousTurnId, orderKey);
     if (input.turnIndex === undefined) turn.turnIndex = orderKey;
+    recordTurnIndex(turn, input.turnIndex);
     turn.label = input.userMessagePreview ?? this.pendingUserText ? `${createTurnLabel(turn)} · ${input.userMessagePreview ?? this.pendingUserText}` : createTurnLabel(turn);
     turn.parentId = this.root.id;
     this.root.children.push(turn);
@@ -939,18 +1105,37 @@ class ActivityTreeStoreImpl implements ActivityStore {
   updateActiveAgentTurn(input: ActivityStoreTurnInput & { id?: string; turnId?: string } = {}): SubagentTreeNode | undefined {
     const turn = this.findTurn(input.id ?? input.turnId, input.turnIndex);
     if (!turn) return undefined;
-    if (input.turnIndex !== undefined) turn.turnIndex = input.turnIndex;
+    recordTurnIndex(turn, input.turnIndex);
     if (input.userMessagePreview !== undefined) turn.userMessagePreview = input.userMessagePreview;
-    const hadActiveAgentName = turn.activeAgentName !== undefined;
-    if (input.activeAgentName !== undefined && !hadActiveAgentName) turn.activeAgentName = input.activeAgentName;
+    const hadActiveAgentName = normalizeActiveAgentName(turn.activeAgentName);
+    const activeAgentChanged = assignActiveAgentName(turn, input.activeAgentName);
     if (input.streamingText !== undefined) turn.streamingText = input.streamingText;
     if (input.finalText !== undefined) turn.finalText = input.finalText;
     if (input.status) turn.status = mergeStatus(turn.status, input.status);
     if (input.recovered !== undefined) turn.recovered = input.recovered;
     if (input.isCurrent !== undefined) turn.isCurrent = input.isCurrent;
-    if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+    if (input.userMessagePreview !== undefined || activeAgentChanged || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
       turn.label = refreshTurnLabel(turn);
     }
+    recomputeSessionStatus(this.root);
+    this.emitChange();
+    return turn;
+  }
+
+  finishActiveAgentModelTurn(input: ActivityStoreTurnInput & { id?: string; turnId?: string } = {}): SubagentTreeNode | undefined {
+    const turn = this.findTurn(input.id ?? input.turnId, input.turnIndex) ?? this.currentTurn;
+    if (!turn) return undefined;
+    recordTurnIndex(turn, input.turnIndex);
+    if (input.userMessagePreview !== undefined) turn.userMessagePreview = input.userMessagePreview;
+    const hadActiveAgentName = normalizeActiveAgentName(turn.activeAgentName);
+    const activeAgentChanged = assignActiveAgentName(turn, input.activeAgentName);
+    if (input.streamingText !== undefined) turn.streamingText = input.streamingText;
+    if (input.finalText !== undefined) turn.finalText = input.finalText;
+    if (input.userMessagePreview !== undefined || activeAgentChanged || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+      turn.label = refreshTurnLabel(turn);
+    }
+    this.activeSubagentStack = [];
+    this.settleOrphanedRunningNodes();
     recomputeSessionStatus(this.root);
     this.emitChange();
     return turn;
@@ -962,18 +1147,20 @@ class ActivityTreeStoreImpl implements ActivityStore {
     const nextStatus = input.status ?? (turn.status === "cancelled" ? "cancelled" : turn.status === "error" ? "error" : "success");
     turn.status = mergeStatus(turn.status, nextStatus);
     turn.isCurrent = false;
-    if (input.turnIndex !== undefined) turn.turnIndex = input.turnIndex;
+    recordTurnIndex(turn, input.turnIndex);
     if (input.userMessagePreview !== undefined) turn.userMessagePreview = input.userMessagePreview;
-    const hadActiveAgentName = turn.activeAgentName !== undefined;
-    if (input.activeAgentName !== undefined && !hadActiveAgentName) turn.activeAgentName = input.activeAgentName;
+    const hadActiveAgentName = normalizeActiveAgentName(turn.activeAgentName);
+    const activeAgentChanged = assignActiveAgentName(turn, input.activeAgentName);
     if (input.streamingText !== undefined) turn.streamingText = input.streamingText;
     if (input.finalText !== undefined) turn.finalText = input.finalText;
-    if (input.userMessagePreview !== undefined || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
+    if (input.userMessagePreview !== undefined || activeAgentChanged || (input.activeAgentName !== undefined && !hadActiveAgentName)) {
       turn.label = refreshTurnLabel(turn);
     }
     if (isTerminalStatus(turn.status)) {
       settleTurnChildren(turn);
     }
+    this.settleOrphanedRunningNodes();
+    this.activeSubagentStack = [];
     this.currentTurn = undefined;
     recomputeSessionStatus(this.root);
     this.emitChange();
@@ -981,19 +1168,60 @@ class ActivityTreeStoreImpl implements ActivityStore {
   }
 
   startSubagentTool(input: ActivityStoreSubagentInput = {}): SubagentTreeNode | undefined {
+    const activeParent = this.activeSubagentStack.length > 0
+      ? this.activeSubagentStack[this.activeSubagentStack.length - 1]
+      : undefined;
     const turn = this.ensureCurrentTurn(input.parentTurnId);
     if (!turn) return undefined;
-    const child = upsertSubagentNode(turn, {
+
+    const rootMatch = input.toolCallId ? this.findSubagent(input.toolCallId) : findDirectSubagentNodeBySemanticInput(turn, input);
+    const nestedMatch = !rootMatch && activeParent && activeParent !== turn
+      ? findDirectSubagentNodeBySemanticInput(activeParent, input)
+      : undefined;
+    const existing = rootMatch ?? nestedMatch;
+    if (existing) {
+      const parentNode = this.findNodeById(existing.parentId ?? "") ?? this.findParentTurn(existing.parentId);
+      if (input.status) existing.status = mergeStatus(existing.status, input.status);
+      if (input.args && isObject(input.args) && input.toolName) {
+        updateSubagentFromToolCall(existing, {
+          id: input.toolCallId,
+          name: input.toolName,
+          arguments: input.args,
+        });
+      }
+      if (parentNode) {
+        constrainNodeToTerminalParent(parentNode, existing);
+        if (parentNode.kind === "active-agent-turn" && !isTerminalStatus(parentNode.status)) {
+          parentNode.status = mergeStatus(parentNode.status, existing.status === "streaming" ? "streaming" : "running");
+        }
+        if (isTerminalStatus(parentNode.status)) {
+          settleTurnChildren(parentNode);
+        }
+      }
+      removeActiveStackEntriesForNode(this.activeSubagentStack, existing);
+      this.activeSubagentStack.push(existing);
+      this.emitChange();
+      return existing;
+    }
+
+    const parent = activeParent ?? turn;
+    const child = upsertSubagentNode(parent, {
       ...input,
       status: input.status ?? "running",
-    }, turn.children.length + 1);
-    child.status = mergeStatus(child.status, input.status ?? "running");
-    if (!isTerminalStatus(turn.status)) {
-      turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
+    }, parent.children.length + 1);
+    if (input.toolCallId) {
+      const duplicateIndex = this.activeSubagentStack.findIndex((node) => node.toolCallId === input.toolCallId);
+      if (duplicateIndex >= 0) this.activeSubagentStack.splice(duplicateIndex, 1);
     }
-    if (isTerminalStatus(turn.status)) {
-      settleTurnChildren(turn);
+    if (parent.kind === "active-agent-turn" && !isTerminalStatus(parent.status)) {
+      parent.status = mergeStatus(parent.status, child.status === "streaming" ? "streaming" : "running");
     }
+    if (isTerminalStatus(parent.status)) {
+      settleTurnChildren(parent);
+    }
+    constrainNodeToTerminalParent(parent, child);
+    removeActiveStackEntriesForNode(this.activeSubagentStack, child);
+    this.activeSubagentStack.push(child);
     recomputeSessionStatus(this.root);
     this.emitChange();
     return child;
@@ -1001,12 +1229,15 @@ class ActivityTreeStoreImpl implements ActivityStore {
 
   updateSubagentTool(input: ActivityStoreSubagentInput & { id?: string } = {}): SubagentTreeNode | undefined {
     const scopeTurn = input.parentTurnId ? this.findTurn(input.parentTurnId) : this.currentTurn;
-    let child = this.findSubagent(input.id ?? input.toolCallId);
-    if (!child && !input.id && !input.toolCallId && scopeTurn) {
-      child = findSubagentNodeBySemanticInput(scopeTurn, input);
-    }
+    const activeParent = this.activeSubagentStack.length > 0
+      ? this.activeSubagentStack[this.activeSubagentStack.length - 1]
+      : undefined;
+    const rootMatch = this.findSubagent(input.id ?? input.toolCallId)
+      ?? (!input.id && !input.toolCallId && scopeTurn ? findDirectSubagentNodeBySemanticInput(scopeTurn, input) : undefined);
+    let child = rootMatch
+      ?? (!input.id && !input.toolCallId && activeParent && activeParent !== scopeTurn ? findDirectSubagentNodeBySemanticInput(activeParent, input) : undefined);
     if (!child) return input.toolCallId ? this.startSubagentTool(input) : undefined;
-    const turn = this.findParentTurn(child.parentId);
+    const parentNode = this.findNodeById(child.parentId ?? "") ?? this.findParentTurn(child.parentId);
     if (input.toolName) child.toolName = input.toolName;
     if (input.status) child.status = mergeStatus(child.status, input.status);
     if (input.args && isObject(input.args) && input.toolName) {
@@ -1019,12 +1250,15 @@ class ActivityTreeStoreImpl implements ActivityStore {
     const parsedResult = parseSubagentResult(input.result);
     if (parsedResult) mergeSubagentResult(child, { mode: "single", delegationMode: input.delegationMode ?? child.delegationMode ?? "spawn", projectAgentsDir: input.projectAgentsDir ?? null, results: [parsedResult] }, input.isError === true);
     if (input.isError) child.status = mergeStatus(child.status, "error");
-    if (turn) {
-      constrainNodeToTerminalParent(turn, child);
-      if (!isTerminalStatus(turn.status)) {
-        turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : "running");
-      } else {
-        settleTurnChildren(turn);
+    if (parentNode) {
+      constrainNodeToTerminalParent(parentNode, child);
+      if (parentNode.kind === "active-agent-turn" && !isTerminalStatus(parentNode.status)) {
+        parentNode.status = mergeStatus(parentNode.status, child.status === "streaming" ? "streaming" : "running");
+        if (isTerminalStatus(parentNode.status)) {
+          settleTurnChildren(parentNode);
+        }
+      } else if (isTerminalStatus(parentNode.status)) {
+        settleTurnChildren(parentNode);
       }
     }
     recomputeSessionStatus(this.root);
@@ -1034,24 +1268,42 @@ class ActivityTreeStoreImpl implements ActivityStore {
 
   endSubagentTool(input: ActivityStoreSubagentInput & { id?: string; status?: SubagentNodeStatus } = {}): SubagentTreeNode | undefined {
     const scopeTurn = input.parentTurnId ? this.findTurn(input.parentTurnId) : this.currentTurn;
-    const child = this.findSubagent(input.id ?? input.toolCallId)
-      ?? (!input.id && !input.toolCallId && scopeTurn ? findSubagentNodeBySemanticInput(scopeTurn, input) : undefined)
+    const activeParent = this.activeSubagentStack.length > 0
+      ? this.activeSubagentStack[this.activeSubagentStack.length - 1]
+      : undefined;
+    const rootMatch = this.findSubagent(input.id ?? input.toolCallId)
+      ?? (!input.id && !input.toolCallId && scopeTurn ? findDirectSubagentNodeBySemanticInput(scopeTurn, input) : undefined);
+    const child = rootMatch
+      ?? (!input.id && !input.toolCallId && activeParent && activeParent !== scopeTurn ? findDirectSubagentNodeBySemanticInput(activeParent, input) : undefined)
       ?? (input.toolCallId ? this.startSubagentTool(input) : undefined);
     if (!child) return undefined;
-    const turn = this.findParentTurn(child.parentId);
+    const parentNode = this.findNodeById(child.parentId ?? "") ?? this.findParentTurn(child.parentId);
     const nextStatus = input.status ?? (input.isError ? "error" : child.status === "cancelled" ? "cancelled" : child.status === "error" ? "error" : "success");
     child.status = mergeStatus(child.status, nextStatus);
     const parsedResult = parseSubagentResult(input.result);
     if (parsedResult) mergeSubagentResult(child, { mode: "single", delegationMode: input.delegationMode ?? child.delegationMode ?? "spawn", projectAgentsDir: input.projectAgentsDir ?? null, results: [parsedResult] }, input.isError === true);
     if (input.isError) child.status = mergeStatus(child.status, "error");
-    if (turn) {
-      constrainNodeToTerminalParent(turn, child);
-      if (isTerminalStatus(turn.status)) {
-        settleTurnChildren(turn);
-      } else {
-        turn.status = mergeStatus(turn.status, child.status === "streaming" ? "streaming" : child.status === "running" ? "running" : turn.status);
-        if (turn.status === "pending") turn.status = "running";
+
+    removeActiveStackEntriesForNode(this.activeSubagentStack, child);
+
+    if (parentNode) {
+      constrainNodeToTerminalParent(parentNode, child);
+      if (parentNode.kind === "active-agent-turn") {
+        if (isTerminalStatus(parentNode.status)) {
+          settleTurnChildren(parentNode);
+        } else {
+          parentNode.status = mergeStatus(parentNode.status, child.status === "streaming" ? "streaming" : child.status === "running" ? "running" : parentNode.status);
+          if (parentNode.status === "pending") parentNode.status = "running";
+          if (isTerminalStatus(parentNode.status)) {
+            settleTurnChildren(parentNode);
+          }
+        }
+      } else if (isTerminalStatus(parentNode.status)) {
+        settleTurnChildren(parentNode);
       }
+    }
+    if (isTerminalStatus(child.status) && child.children.length > 0) {
+      settleDescendantStatuses(child, child.status);
     }
     recomputeSessionStatus(this.root);
     this.emitChange();
@@ -1085,11 +1337,35 @@ class ActivityTreeStoreImpl implements ActivityStore {
   }
 
   private findTurn(id?: string, turnIndex?: number): SubagentTreeNode | undefined {
-    if (id) return this.root.children.find((child) => child.id === id || String(child.turnIndex) === id) ?? this.currentTurn;
+    if (id) {
+      const parsed = Number(id);
+      return this.root.children.find((child) => {
+        if (child.id === id) return true;
+        if (String(child.turnIndex) === id) return true;
+        return Array.isArray(child.turnIndices) && Number.isFinite(parsed) && child.turnIndices.includes(parsed);
+      }) ?? this.currentTurn;
+    }
     if (turnIndex !== undefined) {
-      return this.root.children.find((child) => child.turnIndex === turnIndex) ?? this.currentTurn;
+      return this.root.children.find((child) => child.turnIndex === turnIndex || child.turnIndices?.includes(turnIndex)) ?? this.currentTurn;
     }
     return this.currentTurn;
+  }
+
+  private findNodeById(id: string): SubagentTreeNode | undefined {
+    for (const turn of this.root.children) {
+      const found = this.findNodeByIdRecursive(turn, id);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  private findNodeByIdRecursive(node: SubagentTreeNode, id: string): SubagentTreeNode | undefined {
+    if (node.id === id) return node;
+    for (const child of node.children) {
+      const found = this.findNodeByIdRecursive(child, id);
+      if (found) return found;
+    }
+    return undefined;
   }
 
   private findParentTurn(parentId?: string | null): SubagentTreeNode | undefined {
@@ -1104,6 +1380,14 @@ class ActivityTreeStoreImpl implements ActivityStore {
       if (found) return found;
     }
     return undefined;
+  }
+
+  private settleOrphanedRunningNodes(): void {
+    for (const turn of this.root.children) {
+      if (isTerminalStatus(turn.status) || !turn.isCurrent) {
+        settleTurnChildren(turn);
+      }
+    }
   }
 }
 
@@ -1178,31 +1462,79 @@ function buildTurnFromAssistantRecord(message: unknown, sessionId?: string | nul
 
 export function buildActivityTreeFromBranch(branch: unknown[], sessionId?: string | null): SubagentTreeNode {
   const root = createSessionNode(sessionId ?? null);
+  const turnMetaMap = extractTurnMetaMap(branch);
   let currentTurn: SubagentTreeNode | undefined;
   let turnIndex = 0;
+  const pendingMetaEntries: TurnMeta[] = [];
 
-  const closeTurnIfNeeded = (turn: SubagentTreeNode | undefined): void => {
-    closeTurn(turn);
+  const attachPendingMetaToCurrent = (): void => {
+    if (!currentTurn || pendingMetaEntries.length === 0) return;
+    for (const meta of pendingMetaEntries) {
+      recordTurnIndex(currentTurn, meta.turnIndex);
+      if (meta.activeAgentName) currentTurn.activeAgentName = meta.activeAgentName;
+    }
+    currentTurn.label = refreshTurnLabel(currentTurn);
+    pendingMetaEntries.length = 0;
+  };
+
+  const materializePendingMetaAsTurns = (): void => {
+    if (pendingMetaEntries.length === 0) return;
+    for (const meta of pendingMetaEntries) {
+      const orderKey = root.children.length + 1;
+      const turn = createTurnNode(sessionId ?? null, {
+        turnIndex: meta.turnIndex,
+        activeAgentName: meta.activeAgentName,
+        recovered: true,
+        isCurrent: false,
+        status: "success",
+      }, root.children.length > 0 ? root.children[root.children.length - 1].id : null, orderKey);
+      turn.parentId = root.id;
+      turn.label = refreshTurnLabel(turn);
+      insertTurnInOrder(root, turn);
+    }
+    pendingMetaEntries.length = 0;
   };
 
   for (const entry of branch) {
+    if (isObject(entry) && entry.type === "custom" && entry.customType === "pi-subagent-turn-meta") {
+      const data = isObject(entry.data) ? entry.data : undefined;
+      const metaTurnIndex = data && typeof data.turnIndex === "number" && Number.isFinite(data.turnIndex) ? data.turnIndex : undefined;
+      if (metaTurnIndex !== undefined) {
+        pendingMetaEntries.push({
+          turnIndex: metaTurnIndex,
+          activeAgentName: normalizeConcreteActiveAgentName(data.activeAgentName),
+          phase: typeof data.phase === "string" && data.phase.trim() ? data.phase.trim() : undefined,
+          version: typeof data.version === "number" && Number.isFinite(data.version) ? data.version : undefined,
+        });
+      }
+      continue;
+    }
+
     if (!isObject(entry) || entry.type !== "message") continue;
     const message = entry.message;
     if (!isObject(message)) continue;
 
     if (message.role === "user") {
-      closeTurnIfNeeded(currentTurn);
+      if (currentTurn) {
+        const isPlaceholderTurn = !currentTurn.userMessagePreview && currentTurn.children.length === 0 && !currentTurn.streamingText && !currentTurn.finalText;
+        if (!isPlaceholderTurn) attachPendingMetaToCurrent();
+        closeTurn(currentTurn);
+        currentTurn = undefined;
+      }
+
       turnIndex += 1;
       currentTurn = createTurnNode(sessionId ?? null, {
-        turnIndex,
+        turnIndex: pendingMetaEntries[0]?.turnIndex ?? turnIndex,
         userMessagePreview: extractUserText(message) || undefined,
         recovered: false,
         isCurrent: false,
         status: "pending",
       }, root.children.length > 0 ? root.children[root.children.length - 1].id : null, root.children.length + 1);
       currentTurn.parentId = root.id;
-      currentTurn.label = currentTurn.userMessagePreview ? `${createTurnLabel(currentTurn)} · ${currentTurn.userMessagePreview}` : createTurnLabel(currentTurn);
       root.children.push(currentTurn);
+      attachPendingMetaToCurrent();
+      currentTurn.label = currentTurn.userMessagePreview ? `${createTurnLabel(currentTurn)} · ${currentTurn.userMessagePreview}` : createTurnLabel(currentTurn);
+      applyTurnMeta(currentTurn, turnMetaMap);
       continue;
     }
 
@@ -1216,7 +1548,9 @@ export function buildActivityTreeFromBranch(branch: unknown[], sessionId?: strin
         isCurrent: false,
       }, root.children.length > 0 ? root.children[root.children.length - 1].id : null, root.children.length + 1);
       currentTurn.parentId = root.id;
+      applyTurnMeta(currentTurn, turnMetaMap);
       root.children.push(currentTurn);
+      attachPendingMetaToCurrent();
     }
 
     if (message.role === "assistant") {
@@ -1248,10 +1582,17 @@ export function buildActivityTreeFromBranch(branch: unknown[], sessionId?: strin
       if (details) {
         mergeSubagentResult(child, details, message.isError === true, Array.isArray(message.content) ? message.content.map((part: unknown) => (isObject(part) && part.type === "text" && typeof part.text === "string" ? part.text : "")).filter(Boolean).join("\n") : undefined);
       }
+      if (message.isError === true) {
+        child.status = mergeStatus(child.status, "error");
+      }
     }
   }
 
-  closeTurnIfNeeded(currentTurn);
+  attachPendingMetaToCurrent();
+  if (currentTurn) closeTurn(currentTurn);
+  materializePendingMetaAsTurns();
+  recoverMissingTurns(root, turnMetaMap, sessionId ?? null);
+  root.children.sort((a, b) => (a.orderKey ?? 0) - (b.orderKey ?? 0));
   root.status = computeAggregateStatus(root.children);
   return root;
 }
@@ -1308,6 +1649,7 @@ function buildTurnDetailLines(node: SubagentTreeNode): string[] {
   lines.push(`${node.label} ${statusBadge(node.status)}`);
   if (node.sessionId) lines.push(`Session: ${node.sessionId}`);
   if (node.turnIndex !== undefined) lines.push(`Turn index: ${node.turnIndex}`);
+  if (node.turnIndices && node.turnIndices.length > 1) lines.push(`Turn indices: ${node.turnIndices.join(", ")}`);
   if (node.previousTurnId) lines.push(`Previous turn: ${node.previousTurnId}`);
   lines.push(`Current: ${node.isCurrent ? "yes" : "no"}`);
   if (node.recovered) lines.push("Recovered: yes");

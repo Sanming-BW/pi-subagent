@@ -34,10 +34,10 @@ export interface SubagentViewerContext {
 type Mode = "tree" | "detail";
 
 const BODY_HEIGHT = 24;
-const TREE_FOOTER_LINES = 5;
+const TREE_FOOTER_LINES = 6;
 const TREE_MAX_LINES = BODY_HEIGHT - TREE_FOOTER_LINES;
 const REFRESH_INTERVAL_MS = 1000;
-const DETAIL_BODY_LINES = BODY_HEIGHT - 2;
+const DETAIL_BODY_LINES = BODY_HEIGHT - 3;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -95,7 +95,7 @@ export function getVisibleSubagentTreeTurnGutterWidth(rows: VisibleSubagentTreeR
   let width = 1;
   for (const row of rows) {
     if (row.visibleDepth !== 0) continue;
-    const index = row.node.turnIndex ?? row.node.orderKey ?? 0;
+    const index = row.node.orderKey ?? 0;
     width = Math.max(width, visibleWidth(`#${index}`));
   }
   return width;
@@ -108,7 +108,7 @@ export function getVisibleSubagentTreeLabel(row: VisibleSubagentTreeRow): string
       : "";
     if (activeAgentName) return activeAgentName;
 
-    const index = row.node.turnIndex ?? row.node.orderKey ?? 0;
+    const index = row.node.orderKey ?? 0;
     const prefix = row.node.recovered ? "Recovered turn" : "Turn";
     return `${prefix} #${index}`;
   }
@@ -124,7 +124,7 @@ export function formatVisibleSubagentTreeRow(
   turnGutterWidth: number,
 ): string {
   const selector = selected ? "› " : "  ";
-  const turnIndex = row.node.turnIndex ?? row.node.orderKey ?? 0;
+  const turnIndex = row.node.orderKey ?? 0;
   const turnGutter = row.visibleDepth === 0
     ? `#${turnIndex}`.padStart(turnGutterWidth, " ")
     : " ".repeat(turnGutterWidth);
@@ -460,11 +460,11 @@ export async function openSubagentViewer(ctx: SubagentViewerContext): Promise<vo
     return component;
   }, {
     overlay: true,
-    overlayOptions: {
+    overlayOptions: ({
       width: "100%",
-      maxHeight: "100%",
+      height: "100%",
       anchor: "center",
       margin: 0,
-    },
+    } as any),
   });
 }

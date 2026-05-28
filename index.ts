@@ -29,7 +29,7 @@ import { buildForkSessionSnapshotJsonl, type SessionSnapshotSource } from "./for
 import { findVisibleLine, formatAvailableLines } from "./line-history.js";
 import { renderCall, renderResult } from "./render.js";
 import { openSubagentViewer, type SubagentViewerContext } from "./subagent-tree-view.js";
-import { createActivityStore, type ActivityStore } from "./subagent-view-data.js";
+import { buildActivityTreeFromBranch, createActivityStore, getSubagentTreeSignature, type ActivityStore } from "./subagent-view-data.js";
 import { materializeCheckpointSnapshot, needsCopyOnWrite } from "./session-checkpoint.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { withLineLock } from "./line-lock.js";
@@ -660,13 +660,8 @@ function buildActiveAgentSystemPrompt(input: {
 
 export default function (pi: ExtensionAPI) {
   let viewerOpen = false;
+  let nextTurnStartsNewUserTurn = false;
   const activityStore: ActivityStore = createActivityStore();
-
-  function getSessionIdFromHeader(header: unknown): string | null {
-    if (!header || typeof header !== "object") return null;
-    const maybe = header as { id?: unknown };
-    return typeof maybe.id === "string" && maybe.id.trim() ? maybe.id : null;
-  }
 
   function getMessageRole(value: unknown): string | null {
     if (!value || typeof value !== "object") return null;
@@ -701,6 +696,108 @@ export default function (pi: ExtensionAPI) {
     } catch {
       /* ignore live-store reconciliation errors */
     }
+  }
+
+  function appendTurnMetaEntry(
+    ctx: { sessionManager: SubagentViewerContext["sessionManager"] },
+    event: unknown,
+    phase: "start" | "end",
+  ): void {
+    try {
+      const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> & {
+        appendCustomEntry?: (customType: string, data?: unknown) => string;
+      } | undefined;
+      if (!manager || typeof manager.appendCustomEntry !== "function") return;
+      const turnIndex = typeof event === "object" && event && typeof (event as { turnIndex?: unknown }).turnIndex === "number"
+        ? (event as { turnIndex: number }).turnIndex
+        : undefined;
+      if (turnIndex === undefined) return;
+      const activeAgentName = getActivityActiveAgentName(activeAgentState);
+      manager.appendCustomEntry("pi-subagent-turn-meta", {
+        version: 2,
+        phase,
+        turnIndex,
+        activeAgentName,
+      });
+    } catch {
+      /* ignore custom entry persistence errors */
+    }
+  }
+
+  function getBranchTreeSignature(branch: unknown[], sessionId: string | null): string {
+    return getSubagentTreeSignature(buildActivityTreeFromBranch(Array.isArray(branch) ? branch : [], sessionId));
+  }
+
+  function getSessionIdFromHeader(header?: unknown): string | null {
+    return header && typeof header === "object" && typeof (header as { id?: unknown }).id === "string"
+      ? (header as { id: string }).id
+      : null;
+  }
+
+  function isCompatibleLiveActiveTurn(liveTurn: unknown, branchTurn: unknown): boolean {
+    if (!liveTurn || !branchTurn || typeof liveTurn !== "object" || typeof branchTurn !== "object") return false;
+    const live = liveTurn as { turnIndex?: unknown; status?: unknown; activeAgentName?: unknown };
+    const branch = branchTurn as { turnIndex?: unknown; status?: unknown; activeAgentName?: unknown };
+    if (live.turnIndex === undefined || branch.turnIndex === undefined) return false;
+    if (live.turnIndex !== branch.turnIndex) return false;
+
+    const liveStatus = typeof live.status === "string" ? live.status : "";
+    const branchStatus = typeof branch.status === "string" ? branch.status : "";
+    const liveAgent = typeof live.activeAgentName === "string" ? live.activeAgentName.trim() : "";
+    const branchAgent = typeof branch.activeAgentName === "string" ? branch.activeAgentName.trim() : "";
+
+    if (liveAgent && branchAgent && liveAgent !== branchAgent) return false;
+    if (liveStatus && branchStatus) {
+      const activeStatuses = new Set(["pending", "running", "streaming"]);
+      const terminalStatuses = new Set(["success", "error", "cancelled", "mixed"]);
+      const liveActive = activeStatuses.has(liveStatus);
+      const branchActive = activeStatuses.has(branchStatus);
+      if (liveActive && branchActive) return true;
+      if (terminalStatuses.has(liveStatus) && terminalStatuses.has(branchStatus)) return true;
+    }
+    return true;
+  }
+
+  function isViewingCurrentActiveSession(
+    activityStore: Pick<ActivityStore, "getTree" | "getSignature"> | undefined,
+    branch: unknown[],
+    header?: unknown,
+  ): boolean {
+    if (!activityStore || typeof activityStore.getTree !== "function" || typeof activityStore.getSignature !== "function") {
+      return false;
+    }
+    const liveTree = activityStore.getTree();
+    if (!liveTree.children || liveTree.children.length === 0) return false;
+
+    const headerSessionId = getSessionIdFromHeader(header);
+    const liveSessionId = liveTree.sessionId ?? null;
+    if (headerSessionId && liveSessionId && headerSessionId !== liveSessionId) return false;
+
+    if (headerSessionId && liveSessionId && headerSessionId === liveSessionId) {
+      return true;
+    }
+
+    const sessionId = headerSessionId ?? liveSessionId;
+    const branchTree = buildActivityTreeFromBranch(Array.isArray(branch) ? branch : [], sessionId);
+    if (activityStore.getSignature() === getSubagentTreeSignature(branchTree)) {
+      return true;
+    }
+
+    const liveTurn = liveTree.children[liveTree.children.length - 1];
+    const branchTurn = branchTree.children[branchTree.children.length - 1];
+    if (liveTurn && branchTurn && isCompatibleLiveActiveTurn(liveTurn, branchTurn)) {
+      return true;
+    }
+
+    if (headerSessionId === null && liveSessionId === null) {
+      const liveActiveTurn = liveTree.children.findLast?.((turn) => turn.kind === "active-agent-turn" && turn.isCurrent) ?? liveTree.children[liveTree.children.length - 1];
+      const branchActiveTurn = branchTree.children[branchTree.children.length - 1];
+      if (liveActiveTurn && branchActiveTurn && isCompatibleLiveActiveTurn(liveActiveTurn, branchActiveTurn)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function handleAgentTurnStart(event: unknown): void {
@@ -754,10 +851,35 @@ export default function (pi: ExtensionAPI) {
   async function guardedOpenSubagentViewer(ctx: SubagentViewerContext): Promise<void> {
     if (!ctx.hasUI) return;
     if (viewerOpen) return;
-    syncStoreFromBranch(ctx);
+
+    const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> | undefined;
+    const branch = manager && typeof manager.getBranch === "function" ? manager.getBranch() : [];
+    const header = manager && typeof manager.getHeader === "function" ? manager.getHeader() : undefined;
+    const branchArray = Array.isArray(branch) ? branch : [];
+    const sessionId = getSessionIdFromHeader(header) ?? activityStore.getTree().sessionId ?? null;
+    const useLiveStore = isViewingCurrentActiveSession(activityStore, branchArray, header);
+
+    let viewerStore: Pick<ActivityStore, "getTree" | "getSignature" | "subscribe">;
+    if (useLiveStore) {
+      const liveSignature = activityStore.getSignature();
+      const branchSignature = getBranchTreeSignature(branchArray, sessionId);
+      if (liveSignature === branchSignature) {
+        syncStoreFromBranch(ctx);
+      }
+      viewerStore = activityStore;
+    } else {
+      const tempStore = createActivityStore();
+      try {
+        tempStore.reconcileBranch(branchArray, header);
+      } catch {
+        /* ignore historical store reconciliation errors */
+      }
+      viewerStore = tempStore;
+    }
+
     viewerOpen = true;
     try {
-      await openSubagentViewer({ ...ctx, activityStore });
+      await openSubagentViewer({ ...ctx, activityStore: viewerStore });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui?.notify?.(`Subagent viewer failed: ${message}`, "error");
@@ -889,8 +1011,12 @@ export default function (pi: ExtensionAPI) {
     activeAgentState.activeAgentName = undefined;
     activeAgentState.activeAgent = undefined;
     updateActiveAgentStatus(ctx, undefined);
+    if (activityStore.getCurrentTurn()) {
+      activityStore.endActiveAgentTurn({ status: "success", activeAgentName: getActivityActiveAgentName(activeAgentState) });
+    }
     const header = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]> | undefined)?.getHeader?.();
     activityStore.reset(getSessionIdFromHeader(header));
+    nextTurnStartsNewUserTurn = false;
     syncStoreFromBranch(ctx);
 
     const config = loadSubagentConfig(ctx.cwd);
@@ -959,7 +1085,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
-    activityStore.beginActiveAgentTurn({ status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState) });
+    nextTurnStartsNewUserTurn = true;
     syncStoreFromBranch(ctx);
   });
 
@@ -967,7 +1093,9 @@ export default function (pi: ExtensionAPI) {
     const turnIndex = typeof (event as { turnIndex?: unknown }).turnIndex === "number"
       ? (event as { turnIndex: number }).turnIndex
       : undefined;
-    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState) });
+    appendTurnMetaEntry(ctx, event, "start");
+    activityStore.beginActiveAgentTurn({ turnIndex, status: "running", isCurrent: true, activeAgentName: getActivityActiveAgentName(activeAgentState), forceNew: nextTurnStartsNewUserTurn });
+    nextTurnStartsNewUserTurn = false;
     syncStoreFromBranch(ctx);
   });
 
@@ -1020,28 +1148,37 @@ export default function (pi: ExtensionAPI) {
     handleToolExecution(event, "end");
   });
 
-  pi.on("turn_end", async (event, _ctx) => {
+  pi.on("turn_end", async (event, ctx) => {
     const message = (event as { message?: unknown }).message;
     const role = getMessageRole(message);
+    const turnIndex = typeof (event as { turnIndex?: unknown }).turnIndex === "number"
+      ? (event as { turnIndex: number }).turnIndex
+      : undefined;
+    const activeAgentName = getActivityActiveAgentName(activeAgentState);
     if (role === "assistant") {
       const text = getMessageText(message);
-      activityStore.updateActiveAgentTurn({
-        status: "success",
+      activityStore.finishActiveAgentModelTurn({
+        activeAgentName,
+        turnIndex,
         streamingText: text ?? undefined,
         finalText: text ?? undefined,
       });
+      if (message && typeof message === "object" && ((message as { stopReason?: unknown }).stopReason === "aborted" || (message as { stopReason?: unknown }).stopReason === "error")) {
+        activityStore.endActiveAgentTurn({ status: (message as { stopReason?: "aborted" | "error" }).stopReason === "aborted" ? "cancelled" : "error", activeAgentName, turnIndex });
+      }
+    } else {
+      activityStore.finishActiveAgentModelTurn({ activeAgentName, turnIndex });
+      if (event && typeof event === "object" && (((event as { status?: unknown }).status === "aborted") || ((event as { status?: unknown }).status === "error"))) {
+        activityStore.endActiveAgentTurn({ status: (event as { status?: "aborted" | "error" }).status === "aborted" ? "cancelled" : "error", activeAgentName, turnIndex });
+      }
     }
-    activityStore.endActiveAgentTurn({
-      status: "success",
-      activeAgentName: getActivityActiveAgentName(activeAgentState),
-      turnIndex: typeof (event as { turnIndex?: unknown }).turnIndex === "number"
-        ? (event as { turnIndex: number }).turnIndex
-        : undefined,
-    });
+    appendTurnMetaEntry(ctx, event, "end");
   });
 
   pi.on("agent_end", async (_event, _ctx) => {
-    activityStore.endActiveAgentTurn({ status: "success", activeAgentName: getActivityActiveAgentName(activeAgentState) });
+    if (activityStore.getCurrentTurn()) {
+      activityStore.endActiveAgentTurn({ status: "success", activeAgentName: getActivityActiveAgentName(activeAgentState) });
+    }
   });
 
   // Inject available agents into the system prompt, or replace it for active-agent mode.
